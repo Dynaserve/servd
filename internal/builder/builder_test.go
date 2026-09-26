@@ -1,6 +1,8 @@
 package builder
 
 import (
+	"servd/platform/internal/dockerfile"
+
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,7 +48,7 @@ func TestDetect(t *testing.T) {
 			},
 			env:   []string{"NEXT_PUBLIC_API"},
 			stack: "next.js", port: 3000,
-			want: []string{"FROM node:20-alpine", "pnpm install --frozen-lockfile", "pnpm run build",
+			want: []string{"FROM node:20-alpine", "pnpm install --frozen-lockfile", "--mount=type=cache,target=/app/.next/cache", "pnpm run build",
 				"--mount=type=secret,id=NEXT_PUBLIC_API,env=NEXT_PUBLIC_API", `"exec pnpm start"`, "HOSTNAME=0.0.0.0"},
 			label: "Node 20 from .nvmrc, pnpm",
 		},
@@ -57,7 +59,13 @@ func TestDetect(t *testing.T) {
 				"package-lock.json": "",
 			},
 			stack: "spa", port: 8080,
-			want: []string{"npm ci", "npm run build", "COPY --from=build /app/dist", "try_files", "listen 8080"},
+			want: []string{"COPY package.json package-lock.json ./\nRUN", "npm ci", "COPY . .\nRUN", "npm run build", "COPY --from=build /app/dist", "try_files", "listen 8080"},
+		},
+		{
+			name:  "postinstall hook installs with full source",
+			files: map[string]string{"package.json": `{"scripts":{"postinstall":"prisma generate","start":"node s.js"}}`},
+			stack: "node", port: 3000,
+			want: []string{"COPY . .\nRUN --mount=type=cache"},
 		},
 		{
 			name:  "node server from main, engines range",
@@ -85,7 +93,7 @@ func TestDetect(t *testing.T) {
 			name:  "fastapi with uvicorn",
 			files: map[string]string{"requirements.txt": "fastapi\nuvicorn[standard]\n", "main.py": "", ".python-version": "3.11.9\n"},
 			stack: "python", port: 8000,
-			want: []string{"FROM python:3.11-slim", "pip install -r requirements.txt", "uvicorn main:app --host 0.0.0.0 --port $PORT"},
+			want: []string{"FROM python:3.11-slim", "COPY requirements.txt ./\nRUN", "pip install -r requirements.txt", "uvicorn main:app --host 0.0.0.0 --port $PORT"},
 		},
 		{
 			name: "django with gunicorn",
@@ -180,6 +188,28 @@ func TestNodeMajor(t *testing.T) {
 	} {
 		if got := nodeMajor(spec); got != want {
 			t.Errorf("nodeMajor(%q) = %d, want %d", spec, got, want)
+		}
+	}
+}
+
+// Every Dockerfile the detector writes must be executable by the native
+// builder, so it must parse.
+func TestGeneratedDockerfilesParse(t *testing.T) {
+	for _, files := range []map[string]string{
+		{"package.json": `{"scripts":{"build":"next build","start":"next start"},"dependencies":{"next":"15"}}`, "pnpm-lock.yaml": ""},
+		{"package.json": `{"scripts":{"build":"vite build"},"devDependencies":{"vite":"6"}}`},
+		{"package.json": `{"scripts":{"start":"node s.js","postinstall":"x"}}`},
+		{"go.mod": "module m\n", "main.go": "package main\n"},
+		{"requirements.txt": "fastapi\nuvicorn\n", "main.py": ""},
+		{"pyproject.toml": "", "app.py": ""},
+		{"index.html": ""},
+	} {
+		p, err := Detect(repo(t, files), []string{"SECRET_ONE"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dockerfile.Parse(p.Dockerfile, nil); err != nil {
+			t.Errorf("%s: %v\n%s", p.Stack, err, p.Dockerfile)
 		}
 	}
 }

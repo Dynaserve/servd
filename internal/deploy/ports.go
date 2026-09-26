@@ -66,10 +66,9 @@ func portListening(port int) bool {
 	return true
 }
 
-// waitListening polls a local TCP port until something accepts, or times out.
-func waitListening(port int, timeout time.Duration) bool {
+// waitListening polls a TCP address until something accepts, or times out.
+func waitListening(addr string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 		if err == nil {

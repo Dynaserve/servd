@@ -12,10 +12,14 @@ cmd/servd/          entrypoint: config from env, wiring, graceful shutdown
 internal/
   api/              HTTP routes, handlers, auth + CORS middleware
   store/            Storer interface; JSON-file and PostgreSQL backends
-  deploy/           deploy pipeline: source → build → container → URL
-                    (build-log cleanup, port allocation)
-  builder/          in-house image builder: detects the stack, writes a Dockerfile
-  docker/           thin wrapper over the docker CLI
+  deploy/           deploy pipeline: source → build → run → URL, zero-downtime;
+                    Runtime interface over the native engine or Docker
+  builder/          stack detection: writes a small, cache-friendly Dockerfile
+  engine/           native engine: daemonless builds + app supervision
+  dockerfile/       parser for the Dockerfile subset the engine executes
+  oci/              image store: registry pulls, shared layers, OCI export
+  sandbox/          hardened sandboxes: userns, netns, seccomp, cgroups (runc)
+  docker/           thin wrapper over the docker CLI (fallback runtime)
   proxy/            per-service reverse proxies on dedicated ports
   github/           GitHub App: installation tokens, repo listing
   session/          verifies the frontend's signed session token
@@ -48,7 +52,14 @@ Config (environment):
 | `SESSION_SECRET` | *(unset)*           | Shared with the frontend; when set, the platform verifies the session cookie (real auth). Unset = dev auth (trusts `X-User`). |
 | `ENCRYPTION_KEY` | *(unset)*           | Exactly 32 bytes; enables storing users' GitHub tokens (AES-256-GCM) so the deploy engine can clone private repos. |
 | `REGION`         | `AU`                | Advertised in the `X-Region` response header. |
-| `APPS_NETWORK`   | `servd-apps`        | Docker bridge network deployed apps run on. |
+| `RUNTIME`        | `auto`              | `native` (built-in engine), `docker`, or `auto` (native when possible, else Docker). |
+| `ENGINE_ROOT`    | `/var/lib/servd`    | Native engine state: images, layers, build caches, sandboxes. |
+| `ENGINE_BRIDGE`  | `servd0`            | Bridge interface sandboxes attach to. |
+| `ENGINE_SUBNET`  | `10.88.0.0/16`      | Sandbox address range (gateway = first address). |
+| `ENGINE_ID_SHIFT`| `100000`            | Host uid/gid that sandbox root maps to (65536 ids from here). |
+| `REGISTRY_MIRROR`| *(unset)*           | Docker Hub pull-through mirror, e.g. `mirror.gcr.io` (avoids anonymous rate limits). |
+| `OCI_RUNTIME`    | *(runc or crun)*    | Path to the OCI runtime binary. |
+| `APPS_NETWORK`   | `servd-apps`        | Docker bridge network deployed apps run on (Docker runtime). |
 | `GITHUB_APP_ID`  | *(unset)*           | GitHub App id; enables private-repo clones via installation tokens (preferred over the OAuth token). |
 | `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_PATH` | *(unset)* | The App's private key (PEM inline, or a path to the `.pem`). Required when `GITHUB_APP_ID` is set. |
 
@@ -71,12 +82,51 @@ GitHub **App** with least-privilege, per-repo, read-only installation tokens:
 When the App is not configured, deploys fall back to the stored user OAuth
 token (public repos only).
 
+### Native engine
+
+By default the platform builds and runs apps itself — no Docker daemon, no
+BuildKit, no Railpack. It needs Linux, root, overlayfs, iptables and an OCI
+runtime binary (`runc` or `crun`), so run the platform on the host (not in
+its own container) for this; otherwise `RUNTIME=auto` falls back to Docker.
+
+**Builds** execute the Dockerfile the detector writes (or the repo's own, if
+it sticks to the supported subset: multi-stage `FROM … AS`, `RUN` with
+`--mount=type=cache|secret`, `COPY` incl. `--from`/`--chown`/`--chmod`/heredocs,
+`ENV`, `ARG`, `WORKDIR`, `USER`, `CMD`, `ENTRYPOINT`, `EXPOSE`). Each step runs
+in a sandbox and becomes a layer keyed by the content that produced it, so
+unchanged steps are skipped instantly; dependencies install from the
+manifests alone, so a code-only change reuses the install layer. Base images
+are pulled straight from registries (parallel, digest-verified), unpacked once
+and shared by every app. Build caches (npm, pip, Go, Next.js) persist per
+service and are never shared between services.
+
+**Apps** run in sandboxes the platform assembles itself; runc only performs
+the final start:
+
+- *user namespace*: sandbox root is an unprivileged host uid (`ENGINE_ID_SHIFT`)
+- *no capabilities* for apps, `no_new_privs`, seccomp filter (no mount,
+  namespaces, ptrace, bpf, io_uring, kernel keyrings, module loading, …)
+- *own network namespace* on an isolated bridge port: apps can't reach each
+  other, the host, or cloud metadata (169.254.0.0/16); egress is NATed
+- *cgroup limits* on memory, CPU and processes; masked `/proc` paths
+
+A supervisor restarts crashed apps (with backoff) and brings apps back after
+a host reboot; apps keep serving while the platform itself restarts.
+Redeploys are zero-downtime: the new version starts beside the old one and
+traffic moves only once it passes its health check, so a failed deploy leaves
+the previous version serving. Built images export to standard OCI layout, so
+they run anywhere (`docker load`, containerd, any registry).
+
+The `Sandbox` backend is an interface (layers + process + limits + network,
+not an OCI bundle), so a microVM backend such as Firecracker can be added for
+KVM hosts without touching the builder or deploy pipeline.
+
 ### Builds
 
-Deploys from git are built by the in-house builder (`internal/builder`), no
-external build tool needed — just the host's Docker (23+, BuildKit). A repo
-that ships a `Dockerfile` is built as-is; otherwise the builder detects the
-stack and generates a small Dockerfile with BuildKit cache mounts:
+Deploys from git are built by the in-house builder (`internal/builder`): it
+detects the stack and generates a small Dockerfile, which the native engine
+executes (or, with `RUNTIME=docker`, the host's Docker 23+ with BuildKit). A
+repo that ships a `Dockerfile` is built as-is:
 
 | Stack | Detected by | Version from | Serves |
 |-------|-------------|--------------|--------|
@@ -88,9 +138,9 @@ stack and generates a small Dockerfile with BuildKit cache mounts:
 | Static | `index.html` | — | unprivileged nginx on 8080 |
 
 npm, pnpm and yarn are picked from the lockfile. A service's env vars are
-passed to install/build steps as BuildKit secrets, so values like
-`NEXT_PUBLIC_*` work at build time without ending up in image layers or
-history. Toolchain variables (`PATH`, `HOME`, `NODE_ENV`, `PORT`, `LD_*`, …)
+passed to install/build steps as secrets, so values like `NEXT_PUBLIC_*` work
+at build time without ending up in image layers or history (changing one
+does rebuild the steps that use it). Toolchain variables (`PATH`, `HOME`, `NODE_ENV`, `PORT`, `LD_*`, …)
 are kept out of builds; the running container still gets them.
 
 ### Auth
@@ -119,7 +169,8 @@ DATABASE_URL=postgres://postgres:dev@localhost:5432/postgres ./platform
 ## Run in Docker
 
 The platform is a static, pure-Go binary, so the image is tiny (distroless)
-and needs no database or Docker-in-Docker. Start Docker Desktop / your VM first,
+and needs no database or Docker-in-Docker. In a container the native engine
+isn't available (it needs the host), so deploys use `RUNTIME=docker` there. Start Docker Desktop / your VM first,
 then from the repo root:
 
 ```bash
@@ -196,6 +247,18 @@ in `url`. Exposed services are re-proxied automatically on restart.
 > can't reach the host's `localhost`.
 
 CORS is open (dev) so the browser can call `:8080` directly.
+
+## Tests
+
+```bash
+go test ./...                                          # unit tests
+sudo SERVD_INTEGRATION=1 go test ./internal/sandbox ./internal/engine
+```
+
+The integration tests need root, runc and registry access; they build and run
+real sandboxes and check isolation (uid mapping, capabilities, seccomp,
+network rules), build caching and secret handling. Set `REGISTRY_MIRROR` if
+Docker Hub rate-limits you.
 
 ## Postman
 

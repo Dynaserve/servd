@@ -16,6 +16,35 @@ type packageJSON struct {
 	Engines         struct {
 		Node string `json:"node"`
 	} `json:"engines"`
+	Workspaces json.RawMessage `json:"workspaces"`
+}
+
+// installNeedsSource reports whether installing dependencies needs the whole
+// repo (workspaces, or lifecycle scripts like `postinstall: prisma generate`)
+// rather than just the manifests.
+func (p *packageJSON) installNeedsSource(dir string) bool {
+	if len(p.Workspaces) > 0 || exists(dir, "pnpm-workspace.yaml") {
+		return true
+	}
+	for _, s := range []string{"preinstall", "install", "postinstall", "prepare"} {
+		if _, ok := p.Scripts[s]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// manifestFiles are copied before installing, so the install layer stays
+// cached until one of them changes.
+func manifestFiles(dir string) []string {
+	var out []string
+	for _, f := range []string{"package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+		"pnpm-lock.yaml", ".npmrc", ".yarnrc", ".yarnrc.yml"} {
+		if exists(dir, f) {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func (p *packageJSON) has(dep string) bool {
@@ -70,20 +99,30 @@ func detectNode(dir, mounts string) (*Plan, error) {
 	_, hasBuild := pkg.Scripts["build"]
 	_, hasStart := pkg.Scripts["start"]
 
+	// Install from the manifests alone when possible, so code-only changes
+	// reuse the cached install layer.
+	copyFirst, copyAfter := "COPY . .\n", ""
+	if !pkg.installNeedsSource(dir) {
+		copyFirst = "COPY " + strings.Join(manifestFiles(dir), " ") + " ./\n"
+		copyAfter = "COPY . .\n"
+	}
 	head := fmt.Sprintf(`# syntax=docker/dockerfile:1
 FROM node:%d-alpine AS build
 WORKDIR /app
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 NEXT_TELEMETRY_DISABLED=1
-COPY . .
-RUN --mount=type=cache,target=%s%s %s
-`, version, pm.cache, mounts, pm.install)
+%sRUN --mount=type=cache,target=%s%s %s
+%s`, version, copyFirst, pm.cache, mounts, pm.install, copyAfter)
 	build := ""
 	if hasBuild {
 		build = fmt.Sprintf("RUN%s %s run build\n", mounts, pm.name)
 	}
 
-	// Next.js: build, then serve with `next start` (honours $PORT).
+	// Next.js: build, then serve with `next start` (honours $PORT). Its
+	// incremental build cache persists between deploys via a cache mount.
 	if pkg.has("next") {
+		if hasBuild {
+			build = fmt.Sprintf("RUN --mount=type=cache,target=/app/.next/cache%s %s run build\n", mounts, pm.name)
+		}
 		start := pm.name + " start"
 		if !hasStart {
 			start = "./node_modules/.bin/next start"

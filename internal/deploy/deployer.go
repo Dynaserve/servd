@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"servd/platform/internal/builder"
-	"servd/platform/internal/docker"
 	"servd/platform/internal/github"
 	"servd/platform/internal/proxy"
 	"servd/platform/internal/secret"
@@ -22,28 +21,26 @@ import (
 // it via the platform proxy. Status and logs are persisted on the service.
 type Deployer struct {
 	store     store.Storer
-	docker    *docker.Client
+	rt        Runtime
 	proxy     *proxy.Manager
-	ports     *portAllocator
 	encKey    []byte      // decrypts stored GitHub tokens (32 bytes), may be empty
 	githubApp *github.App // optional; mints installation tokens for private repos
 }
 
-// deploy resource defaults (per container).
+// deploy resource defaults (per app).
 const (
 	appMemoryMB  = 512
-	appCPUs      = "0.5"
+	appCPUs      = 0.5
 	appPidsLimit = 256
 	buildTimeout = 15 * time.Minute
 )
 
-// New wires the deployer. The docker client's network must already exist.
-func New(st store.Storer, dc *docker.Client, px *proxy.Manager, encKey []byte, githubApp *github.App) *Deployer {
+// New wires the deployer onto a runtime (native engine or Docker).
+func New(st store.Storer, rt Runtime, px *proxy.Manager, encKey []byte, githubApp *github.App) *Deployer {
 	return &Deployer{
 		store:     st,
-		docker:    dc,
+		rt:        rt,
 		proxy:     px,
-		ports:     newPortAllocator(7000, 7999),
 		encKey:    encKey,
 		githubApp: githubApp,
 	}
@@ -52,24 +49,18 @@ func New(st store.Storer, dc *docker.Client, px *proxy.Manager, encKey []byte, g
 // GitHubApp returns the configured GitHub App, or nil.
 func (d *Deployer) GitHubApp() *github.App { return d.githubApp }
 
-// Prewarm pulls the builder's default base images in the background, so the
-// first deploy of each stack skips the cold download (often the slowest part
-// of a fresh build).
-func (d *Deployer) Prewarm() {
-	go func() {
-		for _, img := range builder.BaseImages() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			_, _ = d.docker.Pull(ctx, img)
-			cancel()
-		}
-	}()
-}
+// Runtime returns the runtime builds and apps use.
+func (d *Deployer) Runtime() Runtime { return d.rt }
 
-// Logs returns the recent logs of a running container.
-func (d *Deployer) Logs(containerID string, tail int) (string, error) {
+// Prewarm pulls common base images in the background, so the first deploy of
+// each stack skips the cold download.
+func (d *Deployer) Prewarm() { d.rt.Prewarm() }
+
+// Logs returns the recent output of a service's running app.
+func (d *Deployer) Logs(name string, tail int) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return d.docker.Logs(ctx, containerID, tail)
+	return d.rt.Logs(ctx, name, tail)
 }
 
 // cloneToken returns a token for cloning source. Preference order:
@@ -113,7 +104,12 @@ func (d *Deployer) Deploy(user string, svc store.Service) {
 	defer cancel()
 
 	id := store.IDOf(svc)
-	name := "servd-app-" + id
+	// Each deploy runs under a fresh name next to the previous version, which
+	// keeps serving until the new one is healthy (zero-downtime, and a failed
+	// deploy never takes the site down).
+	prev, _ := svc["containerId"].(string)
+	prevImage, _ := svc["image"].(string)
+	name := appName(id) + "-" + strconv.FormatInt(time.Now().Unix()%1e7, 36)
 	source, _ := svc["source"].(string)
 	branch, _ := svc["branch"].(string)
 
@@ -128,13 +124,13 @@ func (d *Deployer) Deploy(user string, svc store.Service) {
 	if image, ok := imageSource(source); ok {
 		framework = "image"
 		d.log(user, id, info("Pulling image "+image))
-		if out, err := d.docker.Pull(ctx, image); err != nil {
-			d.log(user, id, errline(lastLines(out, 10)))
+		port, err := d.rt.Pull(ctx, image)
+		if err != nil {
+			d.log(user, id, errline(err.Error()))
 			d.fail(user, id, "could not pull image "+image)
 			return
 		}
-		tag = image
-		cport = d.docker.ImagePort(ctx, image)
+		tag, cport = image, port
 		d.log(user, id, success(fmt.Sprintf("Image ready (port %d)", cport)))
 	} else {
 		repo, err := repoURL(source)
@@ -163,42 +159,30 @@ func (d *Deployer) Deploy(user string, svc store.Service) {
 		tag = fmt.Sprintf("servd/%s:%d", id, time.Now().Unix())
 		buildEnv := builder.FilterEnv(stringMap(svc["envVars"]))
 		plan, err := builder.Detect(dir, builder.Keys(buildEnv))
-		if err == nil {
-			err = plan.Write(dir)
-		}
 		if err != nil {
 			d.fail(user, id, err.Error())
 			return
 		}
 		framework, cport = plan.Stack, plan.Port
 		d.log(user, id, success(fmt.Sprintf("Detected %s — will serve on port %d", plan.Label(), plan.Port)))
-		d.log(user, id, info("Building image…"))
+		d.log(user, id, info(fmt.Sprintf("Building image (%s builder)…", d.rt.Name())))
 		buildStart := time.Now()
-		if err := d.buildWithLogs(ctx, user, id, dir, tag, buildEnv); err != nil {
+		if err := d.buildWithLogs(ctx, user, id, BuildRequest{Dir: dir, Tag: tag, Plan: plan, Env: buildEnv, CacheScope: id}); err != nil {
+			d.log(user, id, errline(err.Error()))
 			d.fail(user, id, "build failed — see the build output above")
 			return
 		}
 		d.log(user, id, success(fmt.Sprintf("Image built in %s", time.Since(buildStart).Round(time.Second))))
 	}
 
-	// Replace any previous container, then run the new one (hardened).
-	_ = d.docker.Stop(ctx, name)
-	d.ports.release(intOf(svc["hostPort"])) // free this service's previous port on redeploy
-	hostPort, err := d.ports.allocate()
-	if err != nil {
-		d.fail(user, id, err.Error())
-		return
-	}
+	// Start the new version (replacing any previous one), hardened.
 	d.setStatus(user, id, "deploying", info("Starting isolated container"))
-
-	env := stringMap(svc["envVars"])
-	cid, err := d.docker.RunSecure(ctx, docker.RunSpec{
-		Name: name, Image: tag, HostPort: hostPort, ContainerPort: cport,
-		Env: env, MemoryMB: appMemoryMB, CPUs: appCPUs, PidsLimit: appPidsLimit,
+	addr, err := d.rt.Run(ctx, RunRequest{
+		Name: name, Image: tag, Port: cport, Env: stringMap(svc["envVars"]),
+		MemoryMB: appMemoryMB, CPUs: appCPUs, Pids: appPidsLimit,
 	})
 	if err != nil {
-		d.ports.release(hostPort)
-		d.fail(user, id, "run failed: "+err.Error())
+		d.fail(user, id, "run failed: "+err.Error()+keptNote(prev))
 		return
 	}
 
@@ -207,48 +191,83 @@ func (d *Deployer) Deploy(user string, svc store.Service) {
 	if boolOf(svc["skipHealthCheck"]) {
 		d.log(user, id, info("Health check skipped (per service setting)"))
 		time.Sleep(2 * time.Second) // brief grace for the container to come up
-	} else if !waitListening(hostPort, 60*time.Second) {
-		logs, _ := d.docker.Logs(ctx, cid, 12)
+	} else if !waitListening(addr, 60*time.Second) {
+		logs, _ := d.rt.Logs(ctx, name, 12)
 		d.log(user, id, errline(logs))
-		_ = d.docker.Stop(ctx, name)
-		d.ports.release(hostPort)
-		d.fail(user, id, "health check failed: app did not start listening on port "+strconv.Itoa(cport))
+		d.rt.Stop(ctx, name)
+		d.fail(user, id, "health check failed: app did not start listening on port "+strconv.Itoa(cport)+keptNote(prev))
 		return
 	} else {
 		d.log(user, id, success("Health check passed"))
 	}
 
 	// 6. Route a public URL to it via the proxy.
-	url, err := d.proxy.Expose(id, fmt.Sprintf("http://127.0.0.1:%d", hostPort))
+	url, err := d.proxy.Expose(id, "http://"+addr)
 	if err != nil {
-		d.fail(user, id, "expose failed: "+err.Error())
+		d.rt.Stop(ctx, name)
+		d.fail(user, id, "expose failed: "+err.Error()+keptNote(prev))
 		return
 	}
 
-	// 7. Persist the running state. localUrl is the container's own host port
-	// (127.0.0.1) for direct local testing; publicUrl is the proxied address.
-	localURL := fmt.Sprintf("http://localhost:%d", hostPort)
+	// 7. Persist the running state. localUrl is the app's own address (reachable
+	// from the platform host) for direct testing; publicUrl is the proxied one.
+	localURL := "http://" + addr
 	_, _ = d.store.PatchService(user, id, map[string]any{
 		"status":      "running",
 		"framework":   framework,
-		"containerId": cid,
-		"hostPort":    hostPort,
+		"containerId": name,
+		"runtime":     d.rt.Name(),
+		"image":       builtImage(tag, framework),
 		"localUrl":    localURL,
 		"publicUrl":   url,
-		"proxyTarget": fmt.Sprintf("http://127.0.0.1:%d", hostPort),
+		"proxyTarget": localURL,
 		"exposed":     true,
 	})
 	d.log(user, id, success("Live at "+url+" (local "+localURL+")"))
+
+	// Retire the previous version (and its image) now that traffic has moved.
+	if prev != "" && prev != name {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			d.rt.Stop(ctx, prev)
+			if prevImage != "" && prevImage != tag {
+				d.rt.RemoveImage(ctx, prevImage)
+			}
+		}()
+	}
 }
+
+// builtImage is the image name to clean up on the next deploy: only images we
+// built, never a prebuilt image the user asked for (e.g. "redis:7").
+func builtImage(tag, framework string) string {
+	if framework == "image" {
+		return ""
+	}
+	return tag
+}
+
+// keptNote tells the user their previous version is still up.
+func keptNote(prev string) string {
+	if prev == "" {
+		return ""
+	}
+	return " (the previous version is still serving)"
+}
+
+// appName is the container/sandbox name of a service's app.
+func appName(serviceID string) string { return "servd-app-" + serviceID }
 
 // Stop tears down a service's running container and proxy.
 func (d *Deployer) Stop(user, id string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if svc, _, err := d.store.GetService(user, id); err == nil {
-		d.ports.release(intOf(svc["hostPort"]))
+		if name, _ := svc["containerId"].(string); name != "" {
+			d.rt.Stop(ctx, name)
+		}
 	}
-	_ = d.docker.Stop(ctx, "servd-app-"+id)
+	d.rt.Stop(ctx, appName(id)) // deployments from before per-deploy names
 	d.proxy.Unexpose(id)
 	_, _ = d.store.PatchService(user, id, map[string]any{
 		"status": "stopped", "exposed": false, "publicUrl": "", "localUrl": "",

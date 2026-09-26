@@ -12,19 +12,6 @@ func boolOf(v any) bool {
 	return b
 }
 
-// intOf coerces a stored numeric field (int or JSON float64) to int.
-func intOf(v any) int {
-	switch n := v.(type) {
-	case int:
-		return n
-	case int64:
-		return int(n)
-	case float64:
-		return int(n)
-	}
-	return 0
-}
-
 func stringMap(v any) map[string]string {
 	out := map[string]string{}
 	// service env vars are stored as [{key,value}] by the frontend.

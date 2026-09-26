@@ -151,6 +151,12 @@ func (d *Client) Stop(ctx context.Context, id string) error {
 	return err
 }
 
+// RemoveImage deletes an image (layers still used by others are kept).
+func (d *Client) RemoveImage(ctx context.Context, image string) error {
+	_, err := d.run(ctx, "image", "rm", image)
+	return err
+}
+
 // Logs returns the last `tail` lines of a container's logs.
 func (d *Client) Logs(ctx context.Context, id string, tail int) (string, error) {
 	return d.run(ctx, "logs", "--tail", strconv.Itoa(tail), id)

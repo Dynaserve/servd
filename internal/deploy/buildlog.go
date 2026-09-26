@@ -82,15 +82,11 @@ func (d *Deployer) streamBuild(user, id string, run func(onLine func(string)) er
 	return err
 }
 
-// buildWithLogs builds the image at dir, streaming cleaned output to the
-// service log. buildEnv is exposed to the build as BuildKit secrets.
-func (d *Deployer) buildWithLogs(ctx context.Context, user, id, dir, tag string, buildEnv map[string]string) error {
+// buildWithLogs runs a build, streaming its output to the service log.
+func (d *Deployer) buildWithLogs(ctx context.Context, user, id string, req BuildRequest) error {
 	return d.streamBuild(user, id, func(onLine func(string)) error {
-		return d.docker.BuildStream(ctx, dir, tag, buildEnv, func(raw string) {
-			if line, ok := cleanBuildLine(raw); ok {
-				onLine(line)
-			}
-		})
+		req.OnLine = onLine
+		return d.rt.Build(ctx, req)
 	})
 }
 

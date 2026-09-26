@@ -12,9 +12,11 @@ func detectPython(dir, mounts string) (*Plan, error) {
 	version, from := pythonVersion(dir)
 	deps := strings.ToLower(readFile(dir, "requirements.txt") + "\n" + readFile(dir, "pyproject.toml"))
 
-	install := "pip install ."
+	// With a requirements.txt, install before copying the code so code-only
+	// changes reuse the cached install layer.
+	install, copyFirst, copyAfter := "pip install .", "COPY . .\n", ""
 	if exists(dir, "requirements.txt") {
-		install = "pip install -r requirements.txt"
+		install, copyFirst, copyAfter = "pip install -r requirements.txt", "COPY requirements.txt ./\n", "COPY . .\n"
 	}
 	start, how, err := pythonStart(dir, deps)
 	if err != nil {
@@ -24,12 +26,11 @@ func detectPython(dir, mounts string) (*Plan, error) {
 FROM python:%s-slim
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
-COPY . .
-RUN --mount=type=cache,target=/root/.cache/pip%s %s
-ENV PORT=8000
+%sRUN --mount=type=cache,target=/root/.cache/pip%s %s
+%sENV PORT=8000
 EXPOSE 8000
 %s
-`, version, mounts, install, shellCmd(start))}, nil
+`, version, copyFirst, mounts, install, copyAfter, shellCmd(start))}, nil
 }
 
 // pythonStart works out the start command, in order of preference: a Procfile

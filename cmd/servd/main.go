@@ -23,7 +23,6 @@ import (
 
 	"servd/platform/internal/api"
 	"servd/platform/internal/deploy"
-	"servd/platform/internal/docker"
 	"servd/platform/internal/github"
 	"servd/platform/internal/proxy"
 	"servd/platform/internal/store"
@@ -64,23 +63,17 @@ func main() {
 		log.Printf("github app enabled (private-repo installs)")
 	}
 
-	// Deploy engine: real clone→build→isolated-container→URL pipeline, enabled
-	// only when the docker daemon is reachable.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Deploy engine: the real clone → build → isolated container → URL
+	// pipeline, on the native engine or Docker (see openRuntime).
 	var deployer *deploy.Deployer
-	dc := docker.New(env("APPS_NETWORK", "servd-apps"))
-	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if dc.Available(dctx) {
-		if err := dc.EnsureNetwork(dctx); err != nil {
-			log.Printf("docker network setup failed: %v", err)
-		} else {
-			deployer = deploy.New(st, dc, px, encKey, githubApp)
-			deployer.Prewarm() // pre-pull base images so first builds start warm
-			log.Printf("deploy engine enabled; pre-warming base images")
-		}
-	} else {
-		log.Printf("docker not available: deploys will only record a marker (no real build/run)")
+	if rt := openRuntime(ctx); rt != nil {
+		deployer = deploy.New(st, rt, px, encKey, githubApp)
+		deployer.Prewarm() // pre-pull base images so first builds start warm
+		log.Printf("deploy engine enabled; pre-warming base images")
 	}
-	dcancel()
 
 	srv := api.New(api.Config{
 		Store:         st,
@@ -95,9 +88,6 @@ func main() {
 		Handler:           srv.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	go func() {
 		log.Printf("servd-platform listening on %s", addr)
