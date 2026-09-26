@@ -1,0 +1,172 @@
+{
+  "info": {
+    "name": "Servd Platform API",
+    "description": "REST API for the Servd control plane (Go, :8080). Services are scoped per user via the `X-User` header and per workspace via the URL. Set the collection variables `baseUrl`, `user`, and `workspaceId`; `serviceId` is captured automatically by the \"Create service\" request.\n\nDev auth: this build trusts the `X-User` header; production would verify a signed session token instead.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080", "type": "string" },
+    { "key": "user", "value": "devuser", "type": "string" },
+    { "key": "workspaceId", "value": "workflows", "type": "string" },
+    { "key": "serviceId", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] },
+        "description": "Liveness probe. Returns { status: \"ok\" }."
+      }
+    },
+    {
+      "name": "List workspaces",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "X-User", "value": "{{user}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/workspaces",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "workspaces"]
+        },
+        "description": "The dashboard's workspace groupings (Workflows, Clients, Organizations)."
+      }
+    },
+    {
+      "name": "List services in workspace",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "X-User", "value": "{{user}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/workspaces/{{workspaceId}}/services",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "workspaces", "{{workspaceId}}", "services"]
+        },
+        "description": "All services in a workspace for the current user. This is what the canvas loads on mount."
+      }
+    },
+    {
+      "name": "Replace services (snapshot sync)",
+      "request": {
+        "method": "PUT",
+        "header": [
+          { "key": "X-User", "value": "{{user}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"services\": [\n    {\n      \"id\": \"svc-1\",\n      \"title\": \"API Gateway\",\n      \"source\": \"acme/api\",\n      \"branch\": \"main\",\n      \"suspended\": false,\n      \"variables\": [],\n      \"x\": 120,\n      \"y\": 90\n    }\n  ]\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/workspaces/{{workspaceId}}/services",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "workspaces", "{{workspaceId}}", "services"]
+        },
+        "description": "Overwrite the whole workspace's service list. The canvas uses this to persist its state (debounced). Accepts either {\"services\":[...]} or a bare [...] array. Any service missing an `id` is assigned one."
+      }
+    },
+    {
+      "name": "Create service",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const body = pm.response.json();",
+              "if (body && body.id) {",
+              "  pm.collectionVariables.set('serviceId', body.id);",
+              "  console.log('serviceId =', body.id);",
+              "}",
+              "pm.test('created', () => pm.response.to.have.status(201));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-User", "value": "{{user}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"title\": \"API Server\",\n  \"source\": \"acme/api\",\n  \"branch\": \"main\",\n  \"suspended\": false,\n  \"variables\": [],\n  \"x\": 200,\n  \"y\": 150\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/workspaces/{{workspaceId}}/services",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "workspaces", "{{workspaceId}}", "services"]
+        },
+        "description": "Create one service. The response id is saved to the `serviceId` collection variable for the requests below."
+      }
+    },
+    {
+      "name": "Get service",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "X-User", "value": "{{user}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/services/{{serviceId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "services", "{{serviceId}}"]
+        },
+        "description": "Fetch a single service (and the workspace it lives in) by id."
+      }
+    },
+    {
+      "name": "Update service (patch)",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          { "key": "X-User", "value": "{{user}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"title\": \"API Gateway\",\n  \"suspended\": true\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/services/{{serviceId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "services", "{{serviceId}}"]
+        },
+        "description": "Merge fields into a service. `id` is immutable and ignored if sent."
+      }
+    },
+    {
+      "name": "Deploy service",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-User", "value": "{{user}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"trigger\": \"Redeploy\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/services/{{serviceId}}/deploy",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "services", "{{serviceId}}", "deploy"]
+        },
+        "description": "Record a new deployment on a service (sets `deployment` = { id, startedAt, trigger }). The body is optional; `trigger` defaults to \"Manual deploy\"."
+      }
+    },
+    {
+      "name": "Delete service",
+      "request": {
+        "method": "DELETE",
+        "header": [{ "key": "X-User", "value": "{{user}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/services/{{serviceId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "services", "{{serviceId}}"]
+        },
+        "description": "Remove a service by id."
+      }
+    }
+  ]
+}

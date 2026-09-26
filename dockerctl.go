@@ -1,0 +1,153 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+)
+
+// dockerctl wraps the `docker` CLI. Shelling out (rather than the SDK) keeps the
+// dependency surface small and matches how ops teams run these commands.
+type dockerctl struct {
+	network string
+}
+
+func newDockerctl(network string) *dockerctl { return &dockerctl{network: network} }
+
+// available reports whether the docker daemon is reachable.
+func (d *dockerctl) available(ctx context.Context) bool {
+	return exec.CommandContext(ctx, "docker", "info", "--format", "{{.ServerVersion}}").Run() == nil
+}
+
+// ensureNetwork creates the isolated bridge network apps run on, if missing.
+func (d *dockerctl) ensureNetwork(ctx context.Context) error {
+	if exec.CommandContext(ctx, "docker", "network", "inspect", d.network).Run() == nil {
+		return nil
+	}
+	_, err := d.run(ctx, "network", "create", "--driver", "bridge", d.network)
+	return err
+}
+
+// pull fetches a prebuilt image, returning the combined output.
+func (d *dockerctl) pull(ctx context.Context, image string) (string, error) {
+	out, err := exec.CommandContext(ctx, "docker", "pull", image).CombinedOutput()
+	return string(out), err
+}
+
+// imagePort returns the first port an image EXPOSEs, falling back to a known
+// default for common images (databases, web servers), else 3000.
+func (d *dockerctl) imagePort(ctx context.Context, image string) int {
+	out, err := d.run(ctx, "image", "inspect", "--format",
+		"{{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}", image)
+	if err == nil {
+		for _, tok := range strings.Fields(out) {
+			portStr := strings.SplitN(tok, "/", 2)[0]
+			if n, err := strconv.Atoi(portStr); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return knownImagePort(image)
+}
+
+// build builds an image tagged `tag` from the context at dir, returning the
+// combined build log.
+func (d *dockerctl) build(ctx context.Context, dir, tag string) (string, error) {
+	cmd := exec.CommandContext(ctx, "docker", "build", "-t", tag, dir)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// buildStream builds an image and streams every line of build output (BuildKit
+// progress, npm/next output, …) to onLine as it happens.
+func (d *dockerctl) buildStream(ctx context.Context, dir, tag string, onLine func(string)) error {
+	cmd := exec.CommandContext(ctx, "docker", "build", "--progress=plain", "-t", tag, dir)
+	// BuildKit gives faster, parallel builds and cache mounts; plain progress
+	// streams cleanly line-by-line.
+	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	cmd.Stderr = cmd.Stdout // BuildKit writes progress to stderr; merge them
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // tolerate long lines
+	for sc.Scan() {
+		onLine(sc.Text())
+	}
+	return cmd.Wait()
+}
+
+// runSpec describes a hardened container to launch.
+type runSpec struct {
+	Name          string
+	Image         string
+	HostPort      int // published on 127.0.0.1 only
+	ContainerPort int
+	Env           map[string]string
+	MemoryMB      int
+	CPUs          string // e.g. "0.5"
+	PidsLimit     int
+}
+
+// runSecure starts a detached, isolated container and returns its id.
+//
+// Isolation applied:
+//   - dedicated bridge network (no host networking)
+//   - memory / CPU / PID limits
+//   - all Linux capabilities dropped
+//   - no-new-privileges (blocks setuid escalation)
+//   - published only to 127.0.0.1 (never 0.0.0.0); the platform proxy fronts it
+//   - no host bind mounts, not privileged
+func (d *dockerctl) runSecure(ctx context.Context, s runSpec) (string, error) {
+	args := []string{
+		"run", "-d",
+		"--name", s.Name,
+		"--network", d.network,
+		"--memory", strconv.Itoa(s.MemoryMB) + "m",
+		"--memory-swap", strconv.Itoa(s.MemoryMB) + "m", // disallow swap growth
+		"--cpus", s.CPUs,
+		"--pids-limit", strconv.Itoa(s.PidsLimit),
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges",
+		"--restart", "unless-stopped",
+		"-p", fmt.Sprintf("127.0.0.1:%d:%d", s.HostPort, s.ContainerPort),
+		"-e", "PORT=" + strconv.Itoa(s.ContainerPort),
+	}
+	for k, v := range s.Env {
+		args = append(args, "-e", k+"="+v)
+	}
+	args = append(args, s.Image)
+
+	out, err := d.run(ctx, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func (d *dockerctl) stop(ctx context.Context, id string) error {
+	_, err := d.run(ctx, "rm", "-f", id)
+	return err
+}
+
+// logs returns the last `tail` lines of a container's logs.
+func (d *dockerctl) logs(ctx context.Context, id string, tail int) (string, error) {
+	return d.run(ctx, "logs", "--tail", strconv.Itoa(tail), id)
+}
+
+func (d *dockerctl) run(ctx context.Context, args ...string) (string, error) {
+	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("docker %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
