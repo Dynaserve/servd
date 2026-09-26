@@ -1,4 +1,5 @@
-package main
+// Package docker drives the docker CLI to build, run and inspect app containers.
+package docker
 
 import (
 	"bufio"
@@ -10,21 +11,22 @@ import (
 	"strings"
 )
 
-// dockerctl wraps the `docker` CLI. Shelling out (rather than the SDK) keeps the
+// Client wraps the `docker` CLI. Shelling out (rather than the SDK) keeps the
 // dependency surface small and matches how ops teams run these commands.
-type dockerctl struct {
+type Client struct {
 	network string
 }
 
-func newDockerctl(network string) *dockerctl { return &dockerctl{network: network} }
+// New returns a client whose app containers run on the given bridge network.
+func New(network string) *Client { return &Client{network: network} }
 
-// available reports whether the docker daemon is reachable.
-func (d *dockerctl) available(ctx context.Context) bool {
+// Available reports whether the docker daemon is reachable.
+func (d *Client) Available(ctx context.Context) bool {
 	return exec.CommandContext(ctx, "docker", "info", "--format", "{{.ServerVersion}}").Run() == nil
 }
 
-// ensureNetwork creates the isolated bridge network apps run on, if missing.
-func (d *dockerctl) ensureNetwork(ctx context.Context) error {
+// EnsureNetwork creates the isolated bridge network apps run on, if missing.
+func (d *Client) EnsureNetwork(ctx context.Context) error {
 	if exec.CommandContext(ctx, "docker", "network", "inspect", d.network).Run() == nil {
 		return nil
 	}
@@ -32,15 +34,15 @@ func (d *dockerctl) ensureNetwork(ctx context.Context) error {
 	return err
 }
 
-// pull fetches a prebuilt image, returning the combined output.
-func (d *dockerctl) pull(ctx context.Context, image string) (string, error) {
+// Pull fetches a prebuilt image, returning the combined output.
+func (d *Client) Pull(ctx context.Context, image string) (string, error) {
 	out, err := exec.CommandContext(ctx, "docker", "pull", image).CombinedOutput()
 	return string(out), err
 }
 
-// imagePort returns the first port an image EXPOSEs, falling back to a known
+// ImagePort returns the first port an image EXPOSEs, falling back to a known
 // default for common images (databases, web servers), else 3000.
-func (d *dockerctl) imagePort(ctx context.Context, image string) int {
+func (d *Client) ImagePort(ctx context.Context, image string) int {
 	out, err := d.run(ctx, "image", "inspect", "--format",
 		"{{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}", image)
 	if err == nil {
@@ -51,20 +53,20 @@ func (d *dockerctl) imagePort(ctx context.Context, image string) int {
 			}
 		}
 	}
-	return knownImagePort(image)
+	return KnownImagePort(image)
 }
 
-// build builds an image tagged `tag` from the context at dir, returning the
+// Build builds an image tagged `tag` from the context at dir, returning the
 // combined build log.
-func (d *dockerctl) build(ctx context.Context, dir, tag string) (string, error) {
+func (d *Client) Build(ctx context.Context, dir, tag string) (string, error) {
 	cmd := exec.CommandContext(ctx, "docker", "build", "-t", tag, dir)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
-// buildStream builds an image and streams every line of build output (BuildKit
+// BuildStream builds an image and streams every line of build output (BuildKit
 // progress, npm/next output, …) to onLine as it happens.
-func (d *dockerctl) buildStream(ctx context.Context, dir, tag string, onLine func(string)) error {
+func (d *Client) BuildStream(ctx context.Context, dir, tag string, onLine func(string)) error {
 	cmd := exec.CommandContext(ctx, "docker", "build", "--progress=plain", "-t", tag, dir)
 	// BuildKit gives faster, parallel builds and cache mounts; plain progress
 	// streams cleanly line-by-line.
@@ -86,8 +88,8 @@ func (d *dockerctl) buildStream(ctx context.Context, dir, tag string, onLine fun
 	return cmd.Wait()
 }
 
-// runSpec describes a hardened container to launch.
-type runSpec struct {
+// RunSpec describes a hardened container to launch.
+type RunSpec struct {
 	Name          string
 	Image         string
 	HostPort      int // published on 127.0.0.1 only
@@ -98,7 +100,7 @@ type runSpec struct {
 	PidsLimit     int
 }
 
-// runSecure starts a detached, isolated container and returns its id.
+// RunSecure starts a detached, isolated container and returns its id.
 //
 // Isolation applied:
 //   - dedicated bridge network (no host networking)
@@ -107,7 +109,7 @@ type runSpec struct {
 //   - no-new-privileges (blocks setuid escalation)
 //   - published only to 127.0.0.1 (never 0.0.0.0); the platform proxy fronts it
 //   - no host bind mounts, not privileged
-func (d *dockerctl) runSecure(ctx context.Context, s runSpec) (string, error) {
+func (d *Client) RunSecure(ctx context.Context, s RunSpec) (string, error) {
 	args := []string{
 		"run", "-d",
 		"--name", s.Name,
@@ -134,20 +136,49 @@ func (d *dockerctl) runSecure(ctx context.Context, s runSpec) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-func (d *dockerctl) stop(ctx context.Context, id string) error {
+// Stop force-removes a container by id or name.
+func (d *Client) Stop(ctx context.Context, id string) error {
 	_, err := d.run(ctx, "rm", "-f", id)
 	return err
 }
 
-// logs returns the last `tail` lines of a container's logs.
-func (d *dockerctl) logs(ctx context.Context, id string, tail int) (string, error) {
+// Logs returns the last `tail` lines of a container's logs.
+func (d *Client) Logs(ctx context.Context, id string, tail int) (string, error) {
 	return d.run(ctx, "logs", "--tail", strconv.Itoa(tail), id)
 }
 
-func (d *dockerctl) run(ctx context.Context, args ...string) (string, error) {
+func (d *Client) run(ctx context.Context, args ...string) (string, error) {
 	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("docker %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// KnownImagePort maps common images to the port they listen on, used when the
+// image declares no EXPOSE.
+func KnownImagePort(image string) int {
+	base := image
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	if i := strings.IndexAny(base, ":@"); i >= 0 {
+		base = base[:i]
+	}
+	switch base {
+	case "mongo", "mongodb":
+		return 27017
+	case "postgres", "postgresql":
+		return 5432
+	case "mysql", "mariadb":
+		return 3306
+	case "redis":
+		return 6379
+	case "rabbitmq":
+		return 5672
+	case "nginx", "httpd", "caddy":
+		return 80
+	default:
+		return 3000
+	}
 }

@@ -1,4 +1,5 @@
-package main
+// Package session verifies the signed session tokens issued by the frontend.
+package session
 
 import (
 	"crypto/hmac"
@@ -16,7 +17,8 @@ import (
 // base64url(HMAC-SHA256(body, SESSION_SECRET)). Sharing SESSION_SECRET lets the
 // platform authenticate users without its own login flow.
 
-type sessionUser struct {
+// User is the identity carried in a session.
+type User struct {
 	ID        int64  `json:"id"`
 	Login     string `json:"login"`
 	Name      string `json:"name"`
@@ -24,40 +26,41 @@ type sessionUser struct {
 	AvatarURL string `json:"avatarUrl"`
 }
 
-type sessionPayload struct {
-	User sessionUser `json:"user"`
-	Exp  int64       `json:"exp"` // unix seconds
+type payload struct {
+	User User  `json:"user"`
+	Exp  int64 `json:"exp"` // unix seconds
 }
 
-var errBadSession = errors.New("invalid session")
+// ErrInvalid is returned for a malformed, forged or expired session token.
+var ErrInvalid = errors.New("invalid session")
 
-// verifySession checks a session token's signature and expiry and returns the
+// Verify checks a session token's signature and expiry and returns the
 // user. secret is the shared SESSION_SECRET.
-func verifySession(secret, token string) (*sessionUser, error) {
+func Verify(secret, token string) (*User, error) {
 	body, sig, ok := strings.Cut(token, ".")
 	if !ok || body == "" || sig == "" {
-		return nil, errBadSession
+		return nil, ErrInvalid
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(body))
 	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	if subtle.ConstantTimeCompare([]byte(expected), []byte(sig)) != 1 {
-		return nil, errBadSession
+		return nil, ErrInvalid
 	}
 
 	raw, err := base64.RawURLEncoding.DecodeString(body)
 	if err != nil {
-		return nil, errBadSession
+		return nil, ErrInvalid
 	}
-	var p sessionPayload
+	var p payload
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return nil, errBadSession
+		return nil, ErrInvalid
 	}
 	if p.Exp < time.Now().Unix() {
-		return nil, errBadSession
+		return nil, ErrInvalid
 	}
 	if p.User.Login == "" {
-		return nil, errBadSession
+		return nil, ErrInvalid
 	}
 	return &p.User, nil
 }

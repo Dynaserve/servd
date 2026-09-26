@@ -1,20 +1,11 @@
-package main
+package store
 
 import (
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"sync"
 )
-
-// Service is stored as an opaque JSON object so the store never has to track
-// the frontend's evolving card shape. The only field the backend relies on is
-// "id"; everything else is passed through untouched.
-type Service = map[string]any
-
-// ErrNotFound is returned when a service id does not exist for a user.
-var ErrNotFound = errors.New("service not found")
 
 // FileStore is an in-memory, file-backed Storer, scoped by user and workspace.
 // It is safe for concurrent use and persists every mutation to a JSON file so
@@ -128,7 +119,7 @@ func (s *FileStore) ListWorkspaces(user string) ([]Workspace, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.spaces[user] == nil {
-		seed := append([]Workspace(nil), defaultWorkspaces...)
+		seed := append([]Workspace(nil), DefaultWorkspaces...)
 		s.spaces[user] = seed
 		_ = s.flush()
 	}
@@ -142,7 +133,7 @@ func (s *FileStore) CreateWorkspace(user string, ws Workspace) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.spaces[user] == nil {
-		s.spaces[user] = append([]Workspace(nil), defaultWorkspaces...)
+		s.spaces[user] = append([]Workspace(nil), DefaultWorkspaces...)
 	}
 	s.spaces[user] = append(s.spaces[user], ws)
 	return s.flush()
@@ -192,12 +183,10 @@ func (s *FileStore) ReplaceServices(user, workspace string, services []Service) 
 	// Preserve backend-owned deploy state from the current services.
 	existing := map[string]Service{}
 	for _, svc := range s.userWorkspaces(user)[workspace] {
-		existing[idOf(svc)] = svc
+		existing[IDOf(svc)] = svc
 	}
 	for _, svc := range services {
-		if idOf(svc) == "" {
-			svc["id"] = newID()
-		}
+		ensureID(svc)
 	}
 	preserveBackendFields(services, existing)
 
@@ -212,9 +201,7 @@ func (s *FileStore) ReplaceServices(user, workspace string, services []Service) 
 func (s *FileStore) CreateService(user, workspace string, svc Service) (Service, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if idOf(svc) == "" {
-		svc["id"] = newID()
-	}
+	ensureID(svc)
 	ws := s.userWorkspaces(user)
 	ws[workspace] = append(ws[workspace], svc)
 	if err := s.flush(); err != nil {
@@ -229,7 +216,7 @@ func (s *FileStore) GetService(user, id string) (Service, string, error) {
 	defer s.mu.Unlock()
 	for ws, list := range s.userWorkspaces(user) {
 		for _, svc := range list {
-			if idOf(svc) == id {
+			if IDOf(svc) == id {
 				return svc, ws, nil
 			}
 		}
@@ -243,7 +230,7 @@ func (s *FileStore) PatchService(user, id string, patch map[string]any) (Service
 	defer s.mu.Unlock()
 	for _, list := range s.userWorkspaces(user) {
 		for _, svc := range list {
-			if idOf(svc) == id {
+			if IDOf(svc) == id {
 				for k, v := range patch {
 					if k == "id" {
 						continue // id is immutable
@@ -267,7 +254,7 @@ func (s *FileStore) DeleteService(user, id string) error {
 	ws := s.userWorkspaces(user)
 	for wsID, list := range ws {
 		for i, svc := range list {
-			if idOf(svc) == id {
+			if IDOf(svc) == id {
 				ws[wsID] = append(list[:i], list[i+1:]...)
 				return s.flush()
 			}
@@ -288,14 +275,4 @@ func (s *FileStore) AllServices() ([]Service, error) {
 		}
 	}
 	return out, nil
-}
-
-func idOf(svc Service) string {
-	if svc == nil {
-		return ""
-	}
-	if id, ok := svc["id"].(string); ok {
-		return id
-	}
-	return ""
 }

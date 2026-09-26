@@ -1,11 +1,10 @@
-# Build a fully static binary — the platform is stdlib-only, so no C deps.
-FROM golang:1.23-alpine AS build
+# Build a fully static binary — pure Go (pgx included), so no C deps.
+FROM golang:1.25-alpine AS build
 WORKDIR /src
-COPY go.mod ./
-# No external modules to download, but keep the step for cache friendliness.
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/platform .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/platform ./cmd/servd
 # Pre-create the data dir owned by the distroless nonroot uid (65532) so a
 # freshly-created volume is writable by the unprivileged runtime user.
 RUN mkdir -p /data && chown -R 65532:65532 /data

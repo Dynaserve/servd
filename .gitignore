@@ -4,3 +4,4 @@
 
 .env
 *.pem
+.DS_Store

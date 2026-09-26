@@ -1,16 +1,37 @@
 # Servd Platform API
 
-The Servd control-plane API — a single Go binary, no external services. It
-persists services to a JSON file (no MongoDB) and does not require Docker, so it
-runs anywhere Go runs. It serves the REST API the frontend canvas consumes.
+The Servd control-plane API — a single Go binary. It persists services to a
+JSON file (or PostgreSQL when `DATABASE_URL` is set) and does not require
+Docker, so it runs anywhere Go runs. It serves the REST API the frontend canvas
+consumes.
+
+## Layout
+
+```
+cmd/servd/          entrypoint: config from env, wiring, graceful shutdown
+internal/
+  api/              HTTP routes, handlers, auth + CORS middleware
+  store/            Storer interface; JSON-file and PostgreSQL backends
+  deploy/           deploy pipeline: source → build → container → URL
+                    (buildpack/Railpack builders, build-log cleanup, ports)
+  docker/           thin wrapper over the docker CLI
+  proxy/            per-service reverse proxies on dedicated ports
+  github/           GitHub App: installation tokens, repo listing
+  session/          verifies the frontend's signed session token
+  secret/           AES-256-GCM encryption for tokens at rest
+  brand/            Server / X-Powered-By / X-Region response headers
+  ids/              random id generation
+docs/               Postman collection
+```
 
 ## Run
 
 ```bash
-cd platform
-go build -o platform .
+go build -o platform ./cmd/servd
 ./platform
 ```
+
+Or `./dev.sh`, which loads `.env`, rebuilds, and frees `:8080` first.
 
 Listens on `:8080` (all interfaces), so it is reachable over the LAN at
 `http://<server-ip>:8080` — e.g. `http://172.20.10.2:8080`.
@@ -20,13 +41,14 @@ Config (environment):
 | Var              | Default             | Meaning                                          |
 |------------------|---------------------|--------------------------------------------------|
 | `LISTEN_ADDR`    | `:8080`             | Bind address                                     |
-| `MONGO_URI`      | *(unset)*           | If set, persist to MongoDB instead of a file     |
-| `MONGO_DATABASE` | `dynaserve`         | Mongo database name (when `MONGO_URI` is set)    |
+| `DATABASE_URL`   | *(unset)*           | If set (or `POSTGRES_URL`), persist to PostgreSQL instead of a file |
 | `DATA_FILE`      | `./data/store.json` | JSON store path (used only when `DATABASE_URL` unset) |
 | `PUBLIC_HOST`    | `localhost`         | Hostname advertised in `expose`/deploy URLs      |
 | `SESSION_SECRET` | *(unset)*           | Shared with the frontend; when set, the platform verifies the session cookie (real auth). Unset = dev auth (trusts `X-User`). |
 | `ENCRYPTION_KEY` | *(unset)*           | Exactly 32 bytes; enables storing users' GitHub tokens (AES-256-GCM) so the deploy engine can clone private repos. |
 | `REGION`         | `AU`                | Advertised in the `X-Region` response header. |
+| `APPS_NETWORK`   | `servd-apps`        | Docker bridge network deployed apps run on. |
+| `RAILPACK_BIN`   | *(auto)*            | Path to the Railpack binary (preferred builder when available). |
 | `GITHUB_APP_ID`  | *(unset)*           | GitHub App id; enables private-repo clones via installation tokens (preferred over the OAuth token). |
 | `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_PATH` | *(unset)* | The App's private key (PEM inline, or a path to the `.pem`). Required when `GITHUB_APP_ID` is set. |
 
@@ -61,21 +83,21 @@ longer impersonate. Without `SESSION_SECRET`, it falls back to trusting
 
 The platform picks its store at startup:
 
-- **`MONGO_URI` set** → MongoDB. Services are stored in the `services`
-  collection as `{ _id, user, workspace, service }`, indexed on user/workspace.
+- **`DATABASE_URL` set** → PostgreSQL. Each service is a row in `services`
+  (JSONB `data`, indexed on account/workspace); the schema is created on start.
 - **unset** → the zero-dependency JSON file store (`DATA_FILE`).
 
-Run Mongo in Docker and the platform on the host (so `expose` still works):
+Run Postgres in Docker and the platform on the host (so `expose` still works):
 
 ```bash
-docker compose up -d mongo
-cd platform && MONGO_URI=mongodb://localhost:27017 ./platform
+docker run -d --name servd-pg -e POSTGRES_PASSWORD=dev -p 5432:5432 postgres:16
+DATABASE_URL=postgres://postgres:dev@localhost:5432/postgres ./platform
 ```
 
 ## Run in Docker
 
-The platform is a static, stdlib-only binary, so the image is tiny (distroless)
-and needs no MongoDB or Docker-in-Docker. Start Docker Desktop / your VM first,
+The platform is a static, pure-Go binary, so the image is tiny (distroless)
+and needs no database or Docker-in-Docker. Start Docker Desktop / your VM first,
 then from the repo root:
 
 ```bash
@@ -85,7 +107,6 @@ docker compose up --build
 Or by hand:
 
 ```bash
-cd platform
 docker build -t servd-platform .
 docker run -d --name servd-platform -p 8080:8080 -v servd-data:/data servd-platform
 ```
@@ -123,7 +144,11 @@ should verify a signed session token instead.
 | GET    | `/api/v1/services/{id}/logs`               | Live runtime logs of the container |
 | POST   | `/api/v1/services/{id}/expose`             | Proxy a public URL to a running app |
 | POST   | `/api/v1/services/{id}/unexpose`           | Stop the proxy                   |
+| POST   | `/api/v1/workspaces`                       | Create a workspace               |
+| DELETE | `/api/v1/workspaces/{wid}`                 | Delete a workspace and tear down its services |
 | POST   | `/api/v1/github/token`                     | Store the caller's GitHub token (for private-repo clones) |
+| POST   | `/api/v1/github/installation`              | Store the caller's GitHub App installation id |
+| GET    | `/api/v1/github/repos`                     | Repos the GitHub App can access (repo picker) |
 
 ### Exposing a running app (reverse proxy)
 
@@ -152,7 +177,7 @@ CORS is open (dev) so the browser can call `:8080` directly.
 
 ## Postman
 
-Import `servd-platform.postman_collection.json`. Set the collection variables
+Import `docs/servd-platform.postman_collection.json`. Set the collection variables
 `baseUrl`, `user`, and `workspaceId`; run **Create service** first — it captures
 the new `serviceId` for the get/patch/deploy/delete requests.
 

@@ -1,8 +1,23 @@
-package main
+// Package store persists services, workspaces and per-user GitHub credentials.
+package store
+
+import (
+	"errors"
+
+	"servd/platform/internal/ids"
+)
+
+// Service is stored as an opaque JSON object so the store never has to track
+// the frontend's evolving card shape. The only field the backend relies on is
+// "id"; everything else is passed through untouched.
+type Service = map[string]any
+
+// ErrNotFound is returned when a service id does not exist for a user.
+var ErrNotFound = errors.New("service not found")
 
 // Storer is the persistence contract the API depends on. Two implementations
-// exist: FileStore (JSON file, zero dependencies) and MongoStore (MongoDB).
-// The one used is chosen at startup by whether MONGO_URI is set.
+// exist: FileStore (JSON file, zero dependencies) and PostgresStore
+// (PostgreSQL). The one used is chosen at startup by whether DATABASE_URL is set.
 type Storer interface {
 	// ListServices returns a workspace's services for a user (never nil).
 	ListServices(user, workspace string) ([]Service, error)
@@ -46,8 +61,8 @@ type Workspace struct {
 	Icon        string `json:"icon" bson:"icon"`
 }
 
-// defaultWorkspaces seed a brand-new user's dashboard.
-var defaultWorkspaces = []Workspace{
+// DefaultWorkspaces seed a brand-new user's dashboard.
+var DefaultWorkspaces = []Workspace{
 	{"workflows", "Workflows", "Build & run the processes that move work forward.", "Route"},
 	{"clients", "Clients", "Manage the people & accounts you serve.", "Users"},
 	{"organizations", "Organizations", "Group clients & teams under their parent orgs.", "Building2"},
@@ -66,7 +81,7 @@ var backendOwnedKeys = []string{
 // deploy state intact.
 func preserveBackendFields(incoming []Service, existingByID map[string]Service) {
 	for _, svc := range incoming {
-		old, ok := existingByID[idOf(svc)]
+		old, ok := existingByID[IDOf(svc)]
 		if !ok {
 			continue
 		}
@@ -75,5 +90,23 @@ func preserveBackendFields(incoming []Service, existingByID map[string]Service) 
 				svc[k] = v
 			}
 		}
+	}
+}
+
+// IDOf returns a service's id, or "" if it has none.
+func IDOf(svc Service) string {
+	if svc == nil {
+		return ""
+	}
+	if id, ok := svc["id"].(string); ok {
+		return id
+	}
+	return ""
+}
+
+// ensureID assigns a fresh id to a service that lacks one.
+func ensureID(svc Service) {
+	if IDOf(svc) == "" {
+		svc["id"] = ids.New()
 	}
 }

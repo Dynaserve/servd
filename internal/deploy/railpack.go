@@ -1,4 +1,4 @@
-package main
+package deploy
 
 import (
 	"bufio"
@@ -20,7 +20,7 @@ type railpack struct {
 
 // newRailpack locates the binary and ensures a BuildKit daemon is running.
 // Returns nil when Railpack can't be used.
-func newRailpack(docker *dockerctl) *railpack {
+func newRailpack() *railpack {
 	bin := findRailpack()
 	if bin == "" {
 		return nil

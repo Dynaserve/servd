@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"context"
@@ -113,16 +113,14 @@ func (p *PostgresStore) ReplaceServices(user, workspace string, services []Servi
 		return nil, err
 	}
 	for _, svc := range current {
-		existing[idOf(svc)] = svc
+		existing[IDOf(svc)] = svc
 	}
 
 	if _, err := tx.Exec(c, `DELETE FROM services WHERE account=$1 AND workspace=$2`, user, workspace); err != nil {
 		return nil, err
 	}
 	for _, svc := range services {
-		if idOf(svc) == "" {
-			svc["id"] = newID()
-		}
+		ensureID(svc)
 	}
 	preserveBackendFields(services, existing)
 	for _, svc := range services {
@@ -132,7 +130,7 @@ func (p *PostgresStore) ReplaceServices(user, workspace string, services []Servi
 		}
 		if _, err := tx.Exec(c,
 			`INSERT INTO services (id, account, workspace, data) VALUES ($1,$2,$3,$4)`,
-			idOf(svc), user, workspace, raw); err != nil {
+			IDOf(svc), user, workspace, raw); err != nil {
 			return nil, err
 		}
 	}
@@ -145,16 +143,14 @@ func (p *PostgresStore) ReplaceServices(user, workspace string, services []Servi
 func (p *PostgresStore) CreateService(user, workspace string, svc Service) (Service, error) {
 	c, cancel := pgCtx()
 	defer cancel()
-	if idOf(svc) == "" {
-		svc["id"] = newID()
-	}
+	ensureID(svc)
 	raw, err := json.Marshal(svc)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := p.pool.Exec(c,
 		`INSERT INTO services (id, account, workspace, data) VALUES ($1,$2,$3,$4)`,
-		idOf(svc), user, workspace, raw); err != nil {
+		IDOf(svc), user, workspace, raw); err != nil {
 		return nil, err
 	}
 	return svc, nil
@@ -294,12 +290,12 @@ func (p *PostgresStore) ListWorkspaces(user string) ([]Workspace, error) {
 		return nil, err
 	}
 	if len(out) == 0 {
-		for _, ws := range defaultWorkspaces {
+		for _, ws := range DefaultWorkspaces {
 			if err := p.CreateWorkspace(user, ws); err != nil {
 				return nil, err
 			}
 		}
-		return append([]Workspace(nil), defaultWorkspaces...), nil
+		return append([]Workspace(nil), DefaultWorkspaces...), nil
 	}
 	return out, nil
 }

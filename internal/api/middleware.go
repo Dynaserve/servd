@@ -1,9 +1,12 @@
-package main
+package api
 
 import (
 	"context"
 	"net/http"
 	"strings"
+
+	"servd/platform/internal/brand"
+	"servd/platform/internal/session"
 )
 
 type ctxKey int
@@ -50,7 +53,7 @@ func resolveUser(secret string, r *http.Request) (string, bool) {
 	if token == "" {
 		return "", false
 	}
-	u, err := verifySession(secret, token)
+	u, err := session.Verify(secret, token)
 	if err != nil {
 		return "", false
 	}
@@ -67,4 +70,31 @@ func sessionToken(r *http.Request) string {
 		return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 	}
 	return ""
+}
+
+// withCORS allows the frontend (any origin, in this dev build) to call the API
+// directly from the browser, including preflight requests. It also stamps the
+// brand headers, advertising region in X-Region.
+func withCORS(region string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		brand.Stamp(h, region)
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = "*"
+		}
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Set("Vary", "Origin")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-User")
+		// Allow the browser to send the session cookie cross-origin (:3000 -> :8080).
+		h.Set("Access-Control-Allow-Credentials", "true")
+		h.Set("Access-Control-Max-Age", "600")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

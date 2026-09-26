@@ -2,5 +2,6 @@ platform
 data/
 *.tmp
 *.md
-*.postman_collection.json
+docs/
+.DS_Store
 .git

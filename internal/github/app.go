@@ -1,4 +1,5 @@
-package main
+// Package github talks to the GitHub API as a GitHub App.
+package github
 
 import (
 	"bytes"
@@ -19,14 +20,14 @@ import (
 	"time"
 )
 
-// GitHubApp mints installation access tokens for a registered GitHub App, so
+// App mints installation access tokens for a registered GitHub App, so
 // the deploy engine can clone private repositories with least-privilege,
 // per-installation, short-lived tokens (rather than a broad user OAuth token).
 //
 // It is optional: when GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY(_PATH) are unset,
-// NewGitHubApp returns nil and the deploy engine falls back to the stored user
+// New returns nil and the deploy engine falls back to the stored user
 // OAuth token.
-type GitHubApp struct {
+type App struct {
 	appID string
 	key   *rsa.PrivateKey
 	http  *http.Client
@@ -39,9 +40,9 @@ type cachedToken struct {
 	expires time.Time
 }
 
-// NewGitHubApp loads the App from the environment, or returns (nil, nil) when
+// New loads the App from the environment, or returns (nil, nil) when
 // it is not configured.
-func NewGitHubApp() (*GitHubApp, error) {
+func New() (*App, error) {
 	appID := os.Getenv("GITHUB_APP_ID")
 	if appID == "" {
 		return nil, nil
@@ -54,7 +55,7 @@ func NewGitHubApp() (*GitHubApp, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse GitHub App private key: %w", err)
 	}
-	return &GitHubApp{
+	return &App{
 		appID: appID,
 		key:   key,
 		http:  &http.Client{Timeout: 15 * time.Second},
@@ -92,7 +93,7 @@ func parseRSAKey(pemBytes []byte) (*rsa.PrivateKey, error) {
 }
 
 // appJWT mints a short-lived RS256 JWT authenticating as the App itself.
-func (g *GitHubApp) appJWT() (string, error) {
+func (g *App) appJWT() (string, error) {
 	now := time.Now()
 	header := map[string]string{"alg": "RS256", "typ": "JWT"}
 	claims := map[string]any{
@@ -119,7 +120,7 @@ func (g *GitHubApp) appJWT() (string, error) {
 
 // InstallationToken returns a valid installation access token, minting a new one
 // (and caching it) when the cached one is missing or near expiry.
-func (g *GitHubApp) InstallationToken(installationID int64) (string, error) {
+func (g *App) InstallationToken(installationID int64) (string, error) {
 	g.mu.Lock()
 	if c, ok := g.cache[installationID]; ok && time.Until(c.expires) > 2*time.Minute {
 		g.mu.Unlock()
@@ -166,7 +167,7 @@ func (g *GitHubApp) InstallationToken(installationID int64) (string, error) {
 // and mints an installation token for it. This handles repos owned by any
 // account (personal or org) the App is installed on, without needing to know
 // the installation id ahead of time.
-func (g *GitHubApp) RepoInstallationToken(owner, repo string) (string, error) {
+func (g *App) RepoInstallationToken(owner, repo string) (string, error) {
 	jwt, err := g.appJWT()
 	if err != nil {
 		return "", err
@@ -216,7 +217,7 @@ type owner struct {
 // across their installations (private and org repos included), newest-push
 // first. When a user OAuth token is given it scopes to the user's own
 // installations; otherwise it falls back to all of the App's installations.
-func (g *GitHubApp) AccessibleRepos(userToken string) ([]Repo, error) {
+func (g *App) AccessibleRepos(userToken string) ([]Repo, error) {
 	ids := g.userInstallationIDs(userToken)
 	if len(ids) == 0 {
 		ids = g.allInstallationIDs()
@@ -241,7 +242,7 @@ func (g *GitHubApp) AccessibleRepos(userToken string) ([]Repo, error) {
 }
 
 // userInstallationIDs returns the installation ids the user belongs to.
-func (g *GitHubApp) userInstallationIDs(userToken string) []int64 {
+func (g *App) userInstallationIDs(userToken string) []int64 {
 	if userToken == "" {
 		return nil
 	}
@@ -261,7 +262,7 @@ func (g *GitHubApp) userInstallationIDs(userToken string) []int64 {
 }
 
 // allInstallationIDs returns every installation of the App.
-func (g *GitHubApp) allInstallationIDs() []int64 {
+func (g *App) allInstallationIDs() []int64 {
 	jwt, err := g.appJWT()
 	if err != nil {
 		return nil
@@ -280,7 +281,7 @@ func (g *GitHubApp) allInstallationIDs() []int64 {
 }
 
 // installationRepos lists the repositories an installation token can access.
-func (g *GitHubApp) installationRepos(instToken string) []Repo {
+func (g *App) installationRepos(instToken string) []Repo {
 	var repos []Repo
 	for page := 1; page <= 5; page++ { // up to 500 repos
 		var body struct {
@@ -299,7 +300,7 @@ func (g *GitHubApp) installationRepos(instToken string) []Repo {
 }
 
 // ghGET performs an authenticated GitHub GET and decodes JSON into out.
-func (g *GitHubApp) ghGET(url, auth string, out any) error {
+func (g *App) ghGET(url, auth string, out any) error {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return err

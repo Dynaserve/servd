@@ -1,4 +1,5 @@
-package main
+// Package secret encrypts values (such as GitHub tokens) at rest.
+package secret
 
 import (
 	"crypto/aes"
@@ -10,9 +11,9 @@ import (
 	"io"
 )
 
-// encrypt seals plaintext with AES-256-GCM using a 32-byte key, returning
+// Encrypt seals plaintext with AES-256-GCM using a 32-byte key, returning
 // base64(nonce||ciphertext). Used to protect stored GitHub tokens at rest.
-func encrypt(key []byte, plaintext string) (string, error) {
+func Encrypt(key []byte, plaintext string) (string, error) {
 	gcm, err := newGCM(key)
 	if err != nil {
 		return "", err
@@ -25,8 +26,8 @@ func encrypt(key []byte, plaintext string) (string, error) {
 	return base64.StdEncoding.EncodeToString(sealed), nil
 }
 
-// decrypt reverses encrypt.
-func decrypt(key []byte, encoded string) (string, error) {
+// Decrypt reverses Encrypt.
+func Decrypt(key []byte, encoded string) (string, error) {
 	gcm, err := newGCM(key)
 	if err != nil {
 		return "", err

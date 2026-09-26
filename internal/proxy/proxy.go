@@ -1,4 +1,6 @@
-package main
+// Package proxy exposes locally-running apps at public URLs through per-service
+// reverse proxies.
+package proxy
 
 import (
 	"context"
@@ -10,18 +12,21 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"servd/platform/internal/brand"
 )
 
-// ProxyManager exposes a locally-running app (e.g. a Next.js dev server) at a
+// Manager exposes a locally-running app (e.g. a Next.js dev server) at a
 // public URL by running a small reverse proxy on a dedicated port. A dedicated
 // port (rather than a path prefix) is used so apps with absolute asset paths —
 // like Next.js's /_next/* — work without any rewriting.
-type ProxyManager struct {
+type Manager struct {
 	mu         sync.Mutex
 	publicHost string // hostname to advertise in URLs (e.g. localhost or a LAN IP)
 	portStart  int
 	portEnd    int
 	nextPort   int
+	region     string                    // advertised in the X-Region header of proxied responses
 	active     map[string]*proxyInstance // serviceID -> running proxy
 }
 
@@ -31,11 +36,12 @@ type proxyInstance struct {
 	server *http.Server
 }
 
-// NewProxyManager builds a manager advertising publicHost, allocating ports in
-// [start, end].
-func NewProxyManager(publicHost string, start, end int) *ProxyManager {
-	return &ProxyManager{
+// NewManager builds a manager advertising publicHost, allocating ports in
+// [start, end]. region is stamped on every proxied response.
+func NewManager(publicHost, region string, start, end int) *Manager {
+	return &Manager{
 		publicHost: publicHost,
+		region:     region,
 		portStart:  start,
 		portEnd:    end,
 		nextPort:   start,
@@ -44,14 +50,14 @@ func NewProxyManager(publicHost string, start, end int) *ProxyManager {
 }
 
 // URLFor returns the public URL an exposed service is reachable at.
-func (m *ProxyManager) URLFor(port int) string {
+func (m *Manager) URLFor(port int) string {
 	return fmt.Sprintf("http://%s:%d", m.publicHost, port)
 }
 
 // Expose starts (or restarts) a reverse proxy for serviceID pointing at target
 // (e.g. "http://localhost:3000") and returns the public URL. Re-exposing an
 // already-active service reuses its port.
-func (m *ProxyManager) Expose(serviceID, target string) (string, error) {
+func (m *Manager) Expose(serviceID, target string) (string, error) {
 	u, err := url.Parse(target)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "", fmt.Errorf("invalid target %q: want e.g. http://localhost:3000", target)
@@ -83,9 +89,7 @@ func (m *ProxyManager) Expose(serviceID, target string) (string, error) {
 	// Override Server / X-Powered-By so the app's framework (Express, Next.js, …)
 	// isn't leaked through the platform; everything served here is "Dynaserve".
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		resp.Header.Set("X-Powered-By", brandName)
-		resp.Header.Set("Server", brandName)
-		resp.Header.Set("X-Region", region)
+		brand.Stamp(resp.Header, m.region)
 		return nil
 	}
 
@@ -104,7 +108,7 @@ func (m *ProxyManager) Expose(serviceID, target string) (string, error) {
 }
 
 // Unexpose stops a service's proxy and frees its port.
-func (m *ProxyManager) Unexpose(serviceID string) {
+func (m *Manager) Unexpose(serviceID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if inst, ok := m.active[serviceID]; ok {
@@ -116,7 +120,7 @@ func (m *ProxyManager) Unexpose(serviceID string) {
 }
 
 // allocatePortLocked returns the next free port in range. Callers hold m.mu.
-func (m *ProxyManager) allocatePortLocked() (int, error) {
+func (m *Manager) allocatePortLocked() (int, error) {
 	span := m.portEnd - m.portStart + 1
 	for i := 0; i < span; i++ {
 		port := m.nextPort
@@ -135,7 +139,7 @@ func (m *ProxyManager) allocatePortLocked() (int, error) {
 	return 0, fmt.Errorf("no free proxy ports in %d-%d", m.portStart, m.portEnd)
 }
 
-func (m *ProxyManager) portInUseLocked(port int) bool {
+func (m *Manager) portInUseLocked(port int) bool {
 	for _, inst := range m.active {
 		if inst.port == port {
 			return true
