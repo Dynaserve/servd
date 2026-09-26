@@ -13,7 +13,8 @@ internal/
   api/              HTTP routes, handlers, auth + CORS middleware
   store/            Storer interface; JSON-file and PostgreSQL backends
   deploy/           deploy pipeline: source → build → container → URL
-                    (buildpack/Railpack builders, build-log cleanup, ports)
+                    (build-log cleanup, port allocation)
+  builder/          in-house image builder: detects the stack, writes a Dockerfile
   docker/           thin wrapper over the docker CLI
   proxy/            per-service reverse proxies on dedicated ports
   github/           GitHub App: installation tokens, repo listing
@@ -48,7 +49,6 @@ Config (environment):
 | `ENCRYPTION_KEY` | *(unset)*           | Exactly 32 bytes; enables storing users' GitHub tokens (AES-256-GCM) so the deploy engine can clone private repos. |
 | `REGION`         | `AU`                | Advertised in the `X-Region` response header. |
 | `APPS_NETWORK`   | `servd-apps`        | Docker bridge network deployed apps run on. |
-| `RAILPACK_BIN`   | *(auto)*            | Path to the Railpack binary (preferred builder when available). |
 | `GITHUB_APP_ID`  | *(unset)*           | GitHub App id; enables private-repo clones via installation tokens (preferred over the OAuth token). |
 | `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_PATH` | *(unset)* | The App's private key (PEM inline, or a path to the `.pem`). Required when `GITHUB_APP_ID` is set. |
 
@@ -70,6 +70,28 @@ GitHub **App** with least-privilege, per-repo, read-only installation tokens:
 
 When the App is not configured, deploys fall back to the stored user OAuth
 token (public repos only).
+
+### Builds
+
+Deploys from git are built by the in-house builder (`internal/builder`), no
+external build tool needed — just the host's Docker (23+, BuildKit). A repo
+that ships a `Dockerfile` is built as-is; otherwise the builder detects the
+stack and generates a small Dockerfile with BuildKit cache mounts:
+
+| Stack | Detected by | Version from | Serves |
+|-------|-------------|--------------|--------|
+| Next.js | `next` dependency | `.nvmrc`, `.node-version`, `engines.node` (default 22) | `start` script / `next start` on 3000 |
+| Static SPA | `build` script, no `start`, and `vite` / `astro` / `@vue/cli-service` / `react-scripts` | as above | build output via unprivileged nginx on 8080, SPA fallback |
+| Node | `package.json` | as above | `start` script, `main`, or `server.js`/`index.js`/… on 3000 |
+| Go | `go.mod` | `go` directive if newer than 1.25 | root or single `cmd/*` main package, distroless, 8080 |
+| Python | `requirements.txt` / `pyproject.toml` | `.python-version`, `runtime.txt`, `requires-python` (default 3.12) | Procfile `web:`, Django, uvicorn, gunicorn or `python main.py` on 8000 |
+| Static | `index.html` | — | unprivileged nginx on 8080 |
+
+npm, pnpm and yarn are picked from the lockfile. A service's env vars are
+passed to install/build steps as BuildKit secrets, so values like
+`NEXT_PUBLIC_*` work at build time without ending up in image layers or
+history. Toolchain variables (`PATH`, `HOME`, `NODE_ENV`, `PORT`, `LD_*`, …)
+are kept out of builds; the running container still gets them.
 
 ### Auth
 

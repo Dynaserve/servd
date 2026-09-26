@@ -82,21 +82,11 @@ func (d *Deployer) streamBuild(user, id string, run func(onLine func(string)) er
 	return err
 }
 
-// dockerBuildWithLogs builds from a generated Dockerfile, streaming cleaned output.
-func (d *Deployer) dockerBuildWithLogs(ctx context.Context, user, id, dir, tag string) error {
+// buildWithLogs builds the image at dir, streaming cleaned output to the
+// service log. buildEnv is exposed to the build as BuildKit secrets.
+func (d *Deployer) buildWithLogs(ctx context.Context, user, id, dir, tag string, buildEnv map[string]string) error {
 	return d.streamBuild(user, id, func(onLine func(string)) error {
-		return d.docker.BuildStream(ctx, dir, tag, func(raw string) {
-			if line, ok := cleanBuildLine(raw); ok {
-				onLine(line)
-			}
-		})
-	})
-}
-
-// railpackBuildWithLogs builds from source with Railpack, streaming cleaned output.
-func (d *Deployer) railpackBuildWithLogs(ctx context.Context, user, id, dir, tag string, env map[string]string) error {
-	return d.streamBuild(user, id, func(onLine func(string)) error {
-		return d.railpack.build(ctx, dir, tag, "servd-"+id, env, func(raw string) {
+		return d.docker.BuildStream(ctx, dir, tag, buildEnv, func(raw string) {
 			if line, ok := cleanBuildLine(raw); ok {
 				onLine(line)
 			}
@@ -105,9 +95,9 @@ func (d *Deployer) railpackBuildWithLogs(ctx context.Context, user, id, dir, tag
 }
 
 var (
-	bkStep    = regexp.MustCompile(`^#\d+\s+`)        // "#10 "
-	bkElapsed = regexp.MustCompile(`^\d+\.\d+\s+`)    // "6.358 "
-	bkMount   = regexp.MustCompile(`^--mount=\S+\s+`) // "--mount=type=cache,... "
+	bkStep    = regexp.MustCompile(`^#\d+\s+`)           // "#10 "
+	bkElapsed = regexp.MustCompile(`^\d+\.\d+\s+`)       // "6.358 "
+	bkMount   = regexp.MustCompile(`^(--mount=\S+\s+)+`) // "--mount=type=cache,... "
 )
 
 // cleanBuildLine turns raw BuildKit --progress=plain output into a readable
@@ -150,7 +140,7 @@ func cleanBuildLine(raw string) (string, bool) {
 		if i := strings.Index(trimmed, "] "); i >= 0 {
 			rest := trimmed[i+2:]
 			if cmd := strings.TrimPrefix(rest, "RUN "); cmd != rest {
-				cmd = bkMount.ReplaceAllString(cmd, "") // hide the cache-mount flag
+				cmd = bkMount.ReplaceAllString(cmd, "") // hide cache/secret mount flags
 				return "$ " + cmd, true
 			}
 			return "", false // COPY / WORKDIR / FROM are noise

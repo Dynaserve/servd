@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -56,21 +57,29 @@ func (d *Client) ImagePort(ctx context.Context, image string) int {
 	return KnownImagePort(image)
 }
 
-// Build builds an image tagged `tag` from the context at dir, returning the
-// combined build log.
-func (d *Client) Build(ctx context.Context, dir, tag string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", "build", "-t", tag, dir)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
-}
-
 // BuildStream builds an image and streams every line of build output (BuildKit
-// progress, npm/next output, …) to onLine as it happens.
-func (d *Client) BuildStream(ctx context.Context, dir, tag string, onLine func(string)) error {
-	cmd := exec.CommandContext(ctx, "docker", "build", "--progress=plain", "-t", tag, dir)
+// progress, npm/next output, …) to onLine as it happens. secrets are exposed
+// to the build as BuildKit secrets (id = key), so their values never land in
+// image layers or history.
+func (d *Client) BuildStream(ctx context.Context, dir, tag string, secrets map[string]string, onLine func(string)) error {
+	args := []string{"build", "--progress=plain", "-t", tag}
 	// BuildKit gives faster, parallel builds and cache mounts; plain progress
 	// streams cleanly line-by-line.
-	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
+	env := append(os.Environ(), "DOCKER_BUILDKIT=1")
+	keys := make([]string, 0, len(secrets))
+	for k := range secrets {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for i, k := range keys {
+		// Hand values to the CLI under private names so a user variable such
+		// as PATH or DOCKER_HOST can't change how the docker CLI itself runs.
+		name := fmt.Sprintf("SERVD_BUILD_SECRET_%d", i)
+		args = append(args, "--secret", "id="+k+",env="+name)
+		env = append(env, name+"="+secrets[k])
+	}
+	cmd := exec.CommandContext(ctx, "docker", append(args, dir)...)
+	cmd.Env = env
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

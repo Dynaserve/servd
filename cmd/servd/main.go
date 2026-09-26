@@ -75,11 +75,7 @@ func main() {
 		} else {
 			deployer = deploy.New(st, dc, px, encKey, githubApp)
 			deployer.Prewarm() // pre-pull base images so first builds start warm
-			builder := "Dockerfile buildpack"
-			if deployer.UsesRailpack() {
-				builder = "Railpack (auto-detect + BuildKit cache)"
-			}
-			log.Printf("deploy engine enabled; builder: %s; pre-warming base images", builder)
+			log.Printf("deploy engine enabled; pre-warming base images")
 		}
 	} else {
 		log.Printf("docker not available: deploys will only record a marker (no real build/run)")

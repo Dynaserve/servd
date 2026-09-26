@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"servd/platform/internal/builder"
 	"servd/platform/internal/docker"
 	"servd/platform/internal/github"
 	"servd/platform/internal/proxy"
@@ -26,7 +27,6 @@ type Deployer struct {
 	ports     *portAllocator
 	encKey    []byte      // decrypts stored GitHub tokens (32 bytes), may be empty
 	githubApp *github.App // optional; mints installation tokens for private repos
-	railpack  *railpack   // optional; preferred builder (better detection + caching)
 }
 
 // deploy resource defaults (per container).
@@ -46,32 +46,18 @@ func New(st store.Storer, dc *docker.Client, px *proxy.Manager, encKey []byte, g
 		ports:     newPortAllocator(7000, 7999),
 		encKey:    encKey,
 		githubApp: githubApp,
-		railpack:  newRailpack(),
 	}
 }
 
 // GitHubApp returns the configured GitHub App, or nil.
 func (d *Deployer) GitHubApp() *github.App { return d.githubApp }
 
-// UsesRailpack reports whether builds go through Railpack rather than the
-// Dockerfile buildpack.
-func (d *Deployer) UsesRailpack() bool { return d.railpack != nil }
-
-// baseImages are pre-pulled on startup so the first deploy of each stack skips
-// the cold base-image download (often the slowest part of a fresh build).
-var baseImages = []string{
-	"node:20-alpine",
-	"golang:1.23-alpine",
-	"python:3.12-slim",
-	"nginx:alpine",
-	"gcr.io/distroless/static-debian12:nonroot",
-	"docker/dockerfile:1",
-}
-
-// Prewarm pulls the common base images in the background so builds start warm.
+// Prewarm pulls the builder's default base images in the background, so the
+// first deploy of each stack skips the cold download (often the slowest part
+// of a fresh build).
 func (d *Deployer) Prewarm() {
 	go func() {
-		for _, img := range baseImages {
+		for _, img := range builder.BaseImages() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			_, _ = d.docker.Pull(ctx, img)
 			cancel()
@@ -175,32 +161,22 @@ func (d *Deployer) Deploy(user string, svc store.Service) {
 		d.log(user, id, success("Cloned"))
 
 		tag = fmt.Sprintf("servd/%s:%d", id, time.Now().Unix())
-		env := stringMap(svc["envVars"])
+		buildEnv := builder.FilterEnv(stringMap(svc["envVars"]))
+		plan, err := builder.Detect(dir, builder.Keys(buildEnv))
+		if err == nil {
+			err = plan.Write(dir)
+		}
+		if err != nil {
+			d.fail(user, id, err.Error())
+			return
+		}
+		framework, cport = plan.Stack, plan.Port
+		d.log(user, id, success(fmt.Sprintf("Detected %s — will serve on port %d", plan.Label(), plan.Port)))
+		d.log(user, id, info("Building image…"))
 		buildStart := time.Now()
-
-		// Prefer Railpack (auto-detects the stack + version, caches per service);
-		// fall back to the Dockerfile buildpack when it's unavailable or the repo
-		// ships its own Dockerfile.
-		if d.railpack != nil && !fileExists(dir, "Dockerfile") {
-			framework, cport = "railpack", 3000
-			d.log(user, id, info("Building with Railpack (auto-detect)…"))
-			if err := d.railpackBuildWithLogs(ctx, user, id, dir, tag, env); err != nil {
-				d.fail(user, id, "build failed — see the build output above")
-				return
-			}
-		} else {
-			fw, port, err := detectAndPrepare(dir)
-			if err != nil {
-				d.fail(user, id, err.Error())
-				return
-			}
-			framework, cport = fw, port
-			d.log(user, id, success(fmt.Sprintf("Detected %s — will serve on port %d", frameworkLabel(fw), port)))
-			d.log(user, id, info("Building image (BuildKit)…"))
-			if err := d.dockerBuildWithLogs(ctx, user, id, dir, tag); err != nil {
-				d.fail(user, id, "build failed — see the build output above")
-				return
-			}
+		if err := d.buildWithLogs(ctx, user, id, dir, tag, buildEnv); err != nil {
+			d.fail(user, id, "build failed — see the build output above")
+			return
 		}
 		d.log(user, id, success(fmt.Sprintf("Image built in %s", time.Since(buildStart).Round(time.Second))))
 	}
