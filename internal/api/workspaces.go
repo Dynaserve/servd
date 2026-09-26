@@ -56,11 +56,7 @@ func (s *Server) deleteWorkspace(w http.ResponseWriter, r *http.Request) {
 	if services, err := s.store.ListServices(user, wid); err == nil {
 		for _, svc := range services {
 			id := store.IDOf(svc)
-			if s.deployer != nil {
-				s.deployer.Stop(user, id)
-			} else {
-				s.proxy.Unexpose(id)
-			}
+			s.teardown(user, id)
 			_ = s.store.DeleteService(user, id)
 		}
 	}

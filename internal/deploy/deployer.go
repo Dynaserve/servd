@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"servd/platform/internal/builder"
@@ -107,9 +108,9 @@ func (d *Deployer) Deploy(user string, svc store.Service) {
 	// Each deploy runs under a fresh name next to the previous version, which
 	// keeps serving until the new one is healthy (zero-downtime, and a failed
 	// deploy never takes the site down).
-	prev, _ := svc["containerId"].(string)
-	prevImage, _ := svc["image"].(string)
-	name := appName(id) + "-" + strconv.FormatInt(time.Now().Unix()%1e7, 36)
+	key := Key(user, id)
+	prev, prevImage := ownedApp(svc, key)
+	name := appName(key) + "-" + strconv.FormatInt(time.Now().Unix()%1e7, 36)
 	source, _ := svc["source"].(string)
 	branch, _ := svc["branch"].(string)
 
@@ -156,7 +157,7 @@ func (d *Deployer) Deploy(user string, svc store.Service) {
 		}
 		d.log(user, id, success("Cloned"))
 
-		tag = fmt.Sprintf("servd/%s:%d", id, time.Now().Unix())
+		tag = fmt.Sprintf("servd/%s:%d", key, time.Now().Unix())
 		buildEnv := builder.FilterEnv(stringMap(svc["envVars"]))
 		plan, err := builder.Detect(dir, builder.Keys(buildEnv))
 		if err != nil {
@@ -167,7 +168,7 @@ func (d *Deployer) Deploy(user string, svc store.Service) {
 		d.log(user, id, success(fmt.Sprintf("Detected %s — will serve on port %d", plan.Label(), plan.Port)))
 		d.log(user, id, info(fmt.Sprintf("Building image (%s builder)…", d.rt.Name())))
 		buildStart := time.Now()
-		if err := d.buildWithLogs(ctx, user, id, BuildRequest{Dir: dir, Tag: tag, Plan: plan, Env: buildEnv, CacheScope: id}); err != nil {
+		if err := d.buildWithLogs(ctx, user, id, BuildRequest{Dir: dir, Tag: tag, Plan: plan, Env: buildEnv, CacheScope: key}); err != nil {
 			d.log(user, id, errline(err.Error()))
 			d.fail(user, id, "build failed — see the build output above")
 			return
@@ -201,16 +202,19 @@ func (d *Deployer) Deploy(user string, svc store.Service) {
 		d.log(user, id, success("Health check passed"))
 	}
 
-	// 6. Route a public URL to it via the proxy.
-	url, err := d.proxy.Expose(id, "http://"+addr)
+	// 6. Route public traffic to it (zero-downtime switch).
+	exp, err := d.proxy.Expose(ServiceRoute(user, svc, "http://"+addr))
 	if err != nil {
 		d.rt.Stop(ctx, name)
 		d.fail(user, id, "expose failed: "+err.Error()+keptNote(prev))
 		return
 	}
+	for dom, why := range exp.Rejected {
+		d.log(user, id, errline(fmt.Sprintf("Custom domain %s not attached: %s", dom, why)))
+	}
 
 	// 7. Persist the running state. localUrl is the app's own address (reachable
-	// from the platform host) for direct testing; publicUrl is the proxied one.
+	// from the platform host) for direct testing; publicUrl is the public one.
 	localURL := "http://" + addr
 	_, _ = d.store.PatchService(user, id, map[string]any{
 		"status":      "running",
@@ -219,11 +223,15 @@ func (d *Deployer) Deploy(user string, svc store.Service) {
 		"runtime":     d.rt.Name(),
 		"image":       builtImage(tag, framework),
 		"localUrl":    localURL,
-		"publicUrl":   url,
+		"publicUrl":   exp.URL,
+		"hostname":    exp.Hostname,
 		"proxyTarget": localURL,
 		"exposed":     true,
 	})
-	d.log(user, id, success("Live at "+url+" (local "+localURL+")"))
+	d.log(user, id, success("Live at "+exp.URL))
+	for _, dom := range exp.Domains {
+		d.log(user, id, success("Also at "+schemeOf(exp.URL)+dom))
+	}
 
 	// Retire the previous version (and its image) now that traffic has moved.
 	if prev != "" && prev != name {
@@ -247,12 +255,33 @@ func builtImage(tag, framework string) string {
 	return tag
 }
 
+// schemeOf returns "https://" or "http://" to match url.
+func schemeOf(url string) string {
+	if strings.HasPrefix(url, "https://") {
+		return "https://"
+	}
+	return "http://"
+}
+
 // keptNote tells the user their previous version is still up.
 func keptNote(prev string) string {
 	if prev == "" {
 		return ""
 	}
 	return " (the previous version is still serving)"
+}
+
+// ownedApp returns the service's recorded app and image names, but only if
+// they belong to key: stored fields are never trusted to name another
+// tenant's app or image.
+func ownedApp(svc store.Service, key string) (app, image string) {
+	if a, _ := svc["containerId"].(string); strings.HasPrefix(a, appName(key)+"-") {
+		app = a
+	}
+	if i, _ := svc["image"].(string); strings.HasPrefix(i, "servd/"+key+":") {
+		image = i
+	}
+	return app, image
 }
 
 // appName is the container/sandbox name of a service's app.
@@ -263,12 +292,11 @@ func (d *Deployer) Stop(user, id string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if svc, _, err := d.store.GetService(user, id); err == nil {
-		if name, _ := svc["containerId"].(string); name != "" {
+		if name, _ := ownedApp(svc, Key(user, id)); name != "" {
 			d.rt.Stop(ctx, name)
 		}
 	}
-	d.rt.Stop(ctx, appName(id)) // deployments from before per-deploy names
-	d.proxy.Unexpose(id)
+	d.proxy.Unexpose(Key(user, id))
 	_, _ = d.store.PatchService(user, id, map[string]any{
 		"status": "stopped", "exposed": false, "publicUrl": "", "localUrl": "",
 	})

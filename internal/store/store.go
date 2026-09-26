@@ -31,8 +31,9 @@ type Storer interface {
 	PatchService(user, id string, patch map[string]any) (Service, error)
 	// DeleteService removes a service by id.
 	DeleteService(user, id string) error
-	// AllServices returns every service across all users and workspaces.
-	AllServices() ([]Service, error)
+	// AllServices returns every service across all users and workspaces,
+	// with its owner.
+	AllServices() ([]Owned, error)
 
 	// SetToken stores a user's (already-encrypted) GitHub token.
 	SetToken(user, encToken string) error
@@ -51,6 +52,12 @@ type Storer interface {
 	CreateWorkspace(user string, ws Workspace) error
 	// DeleteWorkspace removes a workspace record for a user.
 	DeleteWorkspace(user, identifier string) error
+}
+
+// Owned is a service together with the user it belongs to.
+type Owned struct {
+	User    string
+	Service Service
 }
 
 // Workspace is a grouping of services on the dashboard.
@@ -73,14 +80,17 @@ var DefaultWorkspaces = []Workspace{
 // dashboard would wipe live deploy state (status, URL, logs, container id…).
 var backendOwnedKeys = []string{
 	"status", "publicUrl", "localUrl", "hostPort", "containerId",
-	"exposed", "proxyTarget", "framework", "logs",
+	"exposed", "proxyTarget", "framework", "logs", "hostname", "image", "runtime",
+	"deployment",
 }
 
-// preserveBackendFields copies backend-owned keys from the existing service
-// (looked up by id) into each incoming service, so a client sync keeps live
-// deploy state intact.
+// preserveBackendFields makes backend-owned keys of each incoming service
+// come from the stored copy (looked up by id), never from the client: a sync
+// keeps live deploy state intact, and a client can't forge it (e.g. point
+// proxyTarget at another customer's app).
 func preserveBackendFields(incoming []Service, existingByID map[string]Service) {
 	for _, svc := range incoming {
+		StripBackendFields(svc)
 		old, ok := existingByID[IDOf(svc)]
 		if !ok {
 			continue
@@ -90,6 +100,14 @@ func preserveBackendFields(incoming []Service, existingByID map[string]Service) 
 				svc[k] = v
 			}
 		}
+	}
+}
+
+// StripBackendFields removes keys only the platform may set from
+// client-supplied service data.
+func StripBackendFields(svc map[string]any) {
+	for _, k := range backendOwnedKeys {
+		delete(svc, k)
 	}
 }
 

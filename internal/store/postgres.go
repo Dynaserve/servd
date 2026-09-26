@@ -219,14 +219,28 @@ func (p *PostgresStore) DeleteService(user, id string) error {
 	return nil
 }
 
-func (p *PostgresStore) AllServices() ([]Service, error) {
+func (p *PostgresStore) AllServices() ([]Owned, error) {
 	c, cancel := pgCtx()
 	defer cancel()
-	rows, err := p.pool.Query(c, `SELECT data FROM services`)
+	rows, err := p.pool.Query(c, `SELECT account, data FROM services`)
 	if err != nil {
 		return nil, err
 	}
-	return scanServices(rows)
+	defer rows.Close()
+	var out []Owned
+	for rows.Next() {
+		var user string
+		var raw []byte
+		if err := rows.Scan(&user, &raw); err != nil {
+			return nil, err
+		}
+		svc, err := unmarshalService(raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, Owned{User: user, Service: svc})
+	}
+	return out, rows.Err()
 }
 
 // SetToken upserts a user's encrypted GitHub token.

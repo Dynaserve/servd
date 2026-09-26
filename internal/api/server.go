@@ -61,6 +61,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/services/{id}/logs", s.serviceLogs)
 	mux.HandleFunc("POST /api/v1/services/{id}/expose", s.exposeService)
 	mux.HandleFunc("POST /api/v1/services/{id}/unexpose", s.unexposeService)
+	mux.HandleFunc("PUT /api/v1/services/{id}/domains", s.setDomains)
 
 	mux.HandleFunc("POST /api/v1/github/token", s.storeGitHubToken)
 	mux.HandleFunc("POST /api/v1/github/installation", s.storeInstallation)

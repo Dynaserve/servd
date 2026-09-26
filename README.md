@@ -52,6 +52,13 @@ Config (environment):
 | `SESSION_SECRET` | *(unset)*           | Shared with the frontend; when set, the platform verifies the session cookie (real auth). Unset = dev auth (trusts `X-User`). |
 | `ENCRYPTION_KEY` | *(unset)*           | Exactly 32 bytes; enables storing users' GitHub tokens (AES-256-GCM) so the deploy engine can clone private repos. |
 | `REGION`         | `AU`                | Advertised in the `X-Region` response header. |
+| `APPS_DOMAIN`    | *(unset)*           | Serve apps on 80/443 as `https://<app>-<id>.APPS_DOMAIN` with automatic HTTPS. Needs wildcard DNS `*.APPS_DOMAIN` → the server. Unset = apps on ports 9000–9100. |
+| `API_DOMAIN`     | `api.APPS_DOMAIN`   | Also serve the platform API here, over HTTPS. |
+| `ACME_EMAIL`     | *(unset)*           | Contact address for Let's Encrypt. |
+| `ACME_DIRECTORY` | Let's Encrypt       | Certificate authority; set Let's Encrypt staging while testing. |
+| `TLS`            | `on`                | `off` serves the domains over plain HTTP (e.g. behind your own load balancer). |
+| `HTTP_ADDR` / `HTTPS_ADDR` | `:80` / `:443` | Where the front door listens. |
+| `ROUTER_STATE`   | `/var/lib/servd/router` | Certificates and custom-domain ownership. |
 | `RUNTIME`        | `auto`              | `native` (built-in engine), `docker`, or `auto` (native when possible, else Docker). |
 | `ENGINE_ROOT`    | `/var/lib/servd`    | Native engine state: images, layers, build caches, sandboxes. |
 | `ENGINE_BRIDGE`  | `servd0`            | Bridge interface sandboxes attach to. |
@@ -168,13 +175,19 @@ DATABASE_URL=postgres://postgres:dev@localhost:5432/postgres ./platform
 
 ## Deploy to an Ubuntu server
 
-On a fresh Ubuntu 22.04/24.04 server (or Debian), as a user with sudo:
+On a fresh Ubuntu 22.04/24.04 server (or Debian), with a wildcard DNS record
+`*.dynaserve.app` pointing at it:
 
 ```bash
 sudo git clone https://github.com/dynaserve/servd.git /opt/servd
 cd /opt/servd
-sudo ops/install.sh --check
+sudo APPS_DOMAIN=dynaserve.app ACME_EMAIL=ops@dynaserve.app ops/install.sh --check
 ```
+
+Apps are then served on ports 80/443 at `https://<app>-<id>.dynaserve.app`,
+and the API at `https://api.dynaserve.app`. Certificates come from Let's
+Encrypt on each name's first visit (a few seconds) and renew automatically.
+Leave `APPS_DOMAIN` out to serve apps on ports 9000–9100 instead.
 
 The script installs `runc`, git and iptables (and Go, if needed, to build),
 builds `servd` into `/usr/local/bin`, writes `/etc/servd/servd.env` with
@@ -185,9 +198,8 @@ rules, builds); leave it off on later runs.
 
 Then:
 
-- Point the dashboard at `http://<server>:8080` (`NEXT_PUBLIC_PLATFORM_URL`)
+- Point the dashboard at `https://api.dynaserve.app` (`NEXT_PUBLIC_PLATFORM_URL`)
   and give it the same `SESSION_SECRET` as `/etc/servd/servd.env`.
-- Deployed apps get URLs on `http://<server>:9000`–`9100`.
 - Change settings in `/etc/servd/servd.env`, then `sudo systemctl restart servd`.
 - Logs: `journalctl -u servd -f`.
 - Upgrade: `cd /opt/servd && sudo git pull && sudo ops/install.sh`. Running
@@ -248,15 +260,37 @@ should verify a signed session token instead.
 | GET    | `/api/v1/services/{id}/logs`               | Live runtime logs of the container |
 | POST   | `/api/v1/services/{id}/expose`             | Proxy a public URL to a running app |
 | POST   | `/api/v1/services/{id}/unexpose`           | Stop the proxy                   |
+| PUT    | `/api/v1/services/{id}/domains`            | Attach custom domains (domain mode) |
 | POST   | `/api/v1/workspaces`                       | Create a workspace               |
 | DELETE | `/api/v1/workspaces/{wid}`                 | Delete a workspace and tear down its services |
 | POST   | `/api/v1/github/token`                     | Store the caller's GitHub token (for private-repo clones) |
 | POST   | `/api/v1/github/installation`              | Store the caller's GitHub App installation id |
 | GET    | `/api/v1/github/repos`                     | Repos the GitHub App can access (repo picker) |
 
+### Domains and HTTPS
+
+With `APPS_DOMAIN` set, Servd is its own front door on ports 80 and 443:
+
+- Every deployed service gets `https://<title>-<id>.APPS_DOMAIN`. The name is
+  kept across redeploys and title changes.
+- Customers can add their own domains:
+  `PUT /api/v1/services/{id}/domains` with `{"domains":["www.shop.com"]}`, plus
+  a DNS record (CNAME to the service's hostname, or A to the server). A domain
+  belongs to the first service that claims it until that service is deleted,
+  and names under `APPS_DOMAIN` are reserved for the platform.
+- Certificates are requested only for names that are actually routed, so
+  pointing random names at the server can't make it request certificates.
+- HTTP redirects to HTTPS; TLS 1.2+ only. Unknown names and apps that are
+  restarting get a short explanatory page.
+
+Let's Encrypt issues at most 50 new certificates per week per registered
+domain, and each app gets its own. Past that rate, wildcard certificates
+(DNS-01 via your DNS provider's API) are the next step.
+
 ### Exposing a running app (reverse proxy)
 
-`expose` points a public port at a locally-running app (e.g. a Next.js dev
+Port mode only (no `APPS_DOMAIN`); on a public server apps are made public by
+their deploys. `expose` points a public port at a locally-running app (e.g. a Next.js dev
 server) so it's reachable at a real URL. Each exposed service gets its own port
 (9000–9100) — a dedicated port, not a path prefix, so apps with absolute asset
 paths like Next.js's `/_next/*` work with no rewriting.

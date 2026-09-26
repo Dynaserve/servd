@@ -265,13 +265,15 @@ func (s *FileStore) DeleteService(user, id string) error {
 
 // AllServices returns every service across all users and workspaces. Used on
 // startup to restore reverse proxies for services that were exposed.
-func (s *FileStore) AllServices() ([]Service, error) {
+func (s *FileStore) AllServices() ([]Owned, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []Service
-	for _, workspaces := range s.data {
+	var out []Owned
+	for user, workspaces := range s.data {
 		for _, list := range workspaces {
-			out = append(out, list...)
+			for _, svc := range list {
+				out = append(out, Owned{User: user, Service: svc})
+			}
 		}
 	}
 	return out, nil

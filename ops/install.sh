@@ -7,6 +7,9 @@
 # Add --check to also run the isolation self-test on this machine.
 set -euo pipefail
 
+# Optional, used on first install:  APPS_DOMAIN=dynaserve.app ACME_EMAIL=you@x.com sudo -E ops/install.sh
+APPS_DOMAIN="${APPS_DOMAIN:-}"
+ACME_EMAIL="${ACME_EMAIL:-}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 CHECK=false
 [[ "${1:-}" == "--check" ]] && CHECK=true
@@ -21,7 +24,7 @@ command -v apt-get >/dev/null || die "this script supports Ubuntu/Debian (apt)"
 say "Installing system packages (runc, git, iptables)"
 export DEBIAN_FRONTEND=noninteractive
 missing=()
-for pkg in runc git iptables ca-certificates curl openssl; do
+for pkg in runc git iptables iproute2 ca-certificates curl openssl; do
   dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
 done
 if ((${#missing[@]})); then
@@ -61,6 +64,8 @@ install -d -m 0700 /etc/servd
 if [[ ! -f /etc/servd/servd.env ]]; then
   host="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
   sed -e "s|__PUBLIC_HOST__|${host}|" \
+      -e "s|__APPS_DOMAIN__|${APPS_DOMAIN}|" \
+      -e "s|__ACME_EMAIL__|${ACME_EMAIL}|" \
       -e "s|__SESSION_SECRET__|$(openssl rand -hex 32)|" \
       -e "s|__ENCRYPTION_KEY__|$(openssl rand -hex 16)|" \
       ops/servd.env.example > /etc/servd/servd.env
@@ -70,10 +75,24 @@ else
   echo "Keeping existing /etc/servd/servd.env"
 fi
 
+domain="$(sed -n 's/^APPS_DOMAIN=//p' /etc/servd/servd.env)"
+if [[ -n "$domain" ]]; then
+  # servd serves apps on 80/443 itself; nothing else may hold those ports.
+  for port in 80 443; do
+    holder="$(ss -Hltnp "sport = :$port" 2>/dev/null | grep -v servd | grep -oP 'users:\(\("\K[^"]+' | head -1 || true)"
+    [[ -z "$holder" ]] || die "port $port is used by '$holder'; stop it (e.g. systemctl disable --now $holder) so servd can serve apps"
+  done
+fi
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-  say "Opening firewall ports (8080 API, 9000-9100 app URLs)"
+  if [[ -n "$domain" ]]; then
+    say "Opening firewall ports (80/443 apps, 8080 API)"
+    ufw allow 80/tcp >/dev/null
+    ufw allow 443/tcp >/dev/null
+  else
+    say "Opening firewall ports (8080 API, 9000-9100 app URLs)"
+    ufw allow 9000:9100/tcp >/dev/null
+  fi
   ufw allow 8080/tcp >/dev/null
-  ufw allow 9000:9100/tcp >/dev/null
 fi
 
 if $CHECK; then
@@ -96,8 +115,13 @@ if [[ -d /run/systemd/system ]]; then
   journalctl -u servd -n 20 --no-pager | grep -E "runtime:|listening" || true
   . /etc/servd/servd.env
   say "Servd is running"
-  echo "  API:     http://${PUBLIC_HOST}:8080   (point the dashboard's NEXT_PUBLIC_PLATFORM_URL here)"
-  echo "  Apps:    http://${PUBLIC_HOST}:9000-9100"
+  if [[ -n "${APPS_DOMAIN:-}" ]]; then
+    echo "  API:     https://${API_DOMAIN:-api.$APPS_DOMAIN}   (point the dashboard's NEXT_PUBLIC_PLATFORM_URL here)"
+    echo "  Apps:    https://<app>-<id>.${APPS_DOMAIN}   (needs DNS: *.${APPS_DOMAIN} -> this server)"
+  else
+    echo "  API:     http://${PUBLIC_HOST}:8080   (point the dashboard's NEXT_PUBLIC_PLATFORM_URL here)"
+    echo "  Apps:    http://${PUBLIC_HOST}:9000-9100"
+  fi
   echo "  Config:  /etc/servd/servd.env   Logs: journalctl -u servd -f"
 else
   say "Installed. systemd isn't running here; start it with:"

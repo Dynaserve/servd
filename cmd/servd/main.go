@@ -38,7 +38,28 @@ func main() {
 		log.Fatalf("open store: %v", err)
 	}
 
-	px := proxy.NewManager(publicHost, region, 9000, 9100)
+	appsDomain := os.Getenv("APPS_DOMAIN")
+	apiDomain := os.Getenv("API_DOMAIN")
+	if apiDomain == "" && appsDomain != "" {
+		apiDomain = "api." + appsDomain
+	}
+	px, err := proxy.NewManager(proxy.Config{
+		Region:        region,
+		PublicHost:    publicHost,
+		PortStart:     9000,
+		PortEnd:       9100,
+		AppsDomain:    appsDomain,
+		APIDomain:     apiDomain,
+		HTTPAddr:      env("HTTP_ADDR", ":80"),
+		HTTPSAddr:     env("HTTPS_ADDR", ":443"),
+		TLS:           env("TLS", "on") != "off",
+		StateDir:      env("ROUTER_STATE", "/var/lib/servd/router"),
+		ACMEEmail:     os.Getenv("ACME_EMAIL"),
+		ACMEDirectory: os.Getenv("ACME_DIRECTORY"),
+	})
+	if err != nil {
+		log.Fatalf("router: %v", err)
+	}
 	restoreProxies(st, px)
 
 	// Auth + at-rest encryption config.
@@ -83,9 +104,21 @@ func main() {
 		EncKey:        encKey,
 		Region:        region,
 	})
+	handler := srv.Routes()
+	px.SetAPIHandler(handler)
+	if u := px.APIURL(); u != "" {
+		log.Printf("API also served at %s", u)
+	}
+	go func() {
+		if err := px.Serve(ctx); err != nil {
+			log.Printf("router stopped: %v", err)
+			stop()
+		}
+	}()
+
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           srv.Routes(),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -134,12 +167,12 @@ func restoreProxies(st store.Storer, px *proxy.Manager) {
 		log.Printf("restore proxies: list services failed: %v", err)
 		return
 	}
-	for _, svc := range all {
-		exposed, _ := svc["exposed"].(bool)
-		target, _ := svc["proxyTarget"].(string)
+	for _, o := range all {
+		exposed, _ := o.Service["exposed"].(bool)
+		target, _ := o.Service["proxyTarget"].(string)
 		if exposed && target != "" {
-			if _, err := px.Expose(store.IDOf(svc), target); err != nil {
-				log.Printf("restore proxy for %s failed: %v", store.IDOf(svc), err)
+			if _, err := px.Expose(deploy.ServiceRoute(o.User, o.Service, target)); err != nil {
+				log.Printf("restore proxy for %s failed: %v", store.IDOf(o.Service), err)
 			}
 		}
 	}
