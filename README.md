@@ -1,16 +1,42 @@
 # Servd Platform API
 
-The Servd control-plane API — a single Go binary, no external services. It
-persists services to a JSON file (no MongoDB) and does not require Docker, so it
-runs anywhere Go runs. It serves the REST API the frontend canvas consumes.
+The Servd control-plane API — a single Go binary. It persists services to a
+JSON file (or PostgreSQL when `DATABASE_URL` is set) and does not require
+Docker, so it runs anywhere Go runs. It serves the REST API the frontend canvas
+consumes.
+
+## Layout
+
+```
+cmd/servd/          entrypoint: config from env, wiring, graceful shutdown
+internal/
+  api/              HTTP routes, handlers, auth + CORS middleware
+  store/            Storer interface; JSON-file and PostgreSQL backends
+  deploy/           deploy pipeline: source → build → run → URL, zero-downtime;
+                    Runtime interface over the native engine or Docker
+  builder/          stack detection: writes a small, cache-friendly Dockerfile
+  engine/           native engine: daemonless builds + app supervision
+  dockerfile/       parser for the Dockerfile subset the engine executes
+  oci/              image store: registry pulls, shared layers, OCI export
+  sandbox/          hardened sandboxes: userns, netns, seccomp, cgroups (runc)
+  docker/           thin wrapper over the docker CLI (fallback runtime)
+  proxy/            per-service reverse proxies on dedicated ports
+  github/           GitHub App: installation tokens, repo listing
+  session/          verifies the frontend's signed session token
+  secret/           AES-256-GCM encryption for tokens at rest
+  brand/            Server / X-Powered-By / X-Region response headers
+  ids/              random id generation
+docs/               Postman collection
+```
 
 ## Run
 
 ```bash
-cd platform
-go build -o platform .
+go build -o platform ./cmd/servd
 ./platform
 ```
+
+Or `./dev.sh`, which loads `.env`, rebuilds, and frees `:8080` first.
 
 Listens on `:8080` (all interfaces), so it is reachable over the LAN at
 `http://<server-ip>:8080` — e.g. `http://172.20.10.2:8080`.
@@ -20,13 +46,27 @@ Config (environment):
 | Var              | Default             | Meaning                                          |
 |------------------|---------------------|--------------------------------------------------|
 | `LISTEN_ADDR`    | `:8080`             | Bind address                                     |
-| `MONGO_URI`      | *(unset)*           | If set, persist to MongoDB instead of a file     |
-| `MONGO_DATABASE` | `dynaserve`         | Mongo database name (when `MONGO_URI` is set)    |
+| `DATABASE_URL`   | *(unset)*           | If set (or `POSTGRES_URL`), persist to PostgreSQL instead of a file |
 | `DATA_FILE`      | `./data/store.json` | JSON store path (used only when `DATABASE_URL` unset) |
 | `PUBLIC_HOST`    | `localhost`         | Hostname advertised in `expose`/deploy URLs      |
 | `SESSION_SECRET` | *(unset)*           | Shared with the frontend; when set, the platform verifies the session cookie (real auth). Unset = dev auth (trusts `X-User`). |
 | `ENCRYPTION_KEY` | *(unset)*           | Exactly 32 bytes; enables storing users' GitHub tokens (AES-256-GCM) so the deploy engine can clone private repos. |
 | `REGION`         | `AU`                | Advertised in the `X-Region` response header. |
+| `APPS_DOMAIN`    | *(unset)*           | Serve apps on 80/443 as `https://<app>-<id>.APPS_DOMAIN` with automatic HTTPS. Needs wildcard DNS `*.APPS_DOMAIN` → the server. Unset = apps on ports 9000–9100. |
+| `API_DOMAIN`     | `api.APPS_DOMAIN`   | Also serve the platform API here, over HTTPS. |
+| `ACME_EMAIL`     | *(unset)*           | Contact address for Let's Encrypt. |
+| `ACME_DIRECTORY` | Let's Encrypt       | Certificate authority; set Let's Encrypt staging while testing. |
+| `TLS`            | `on`                | `off` serves the domains over plain HTTP (e.g. behind your own load balancer). |
+| `HTTP_ADDR` / `HTTPS_ADDR` | `:80` / `:443` | Where the front door listens. |
+| `ROUTER_STATE`   | `/var/lib/servd/router` | Certificates and custom-domain ownership. |
+| `RUNTIME`        | `auto`              | `native` (built-in engine), `docker`, or `auto` (native when possible, else Docker). |
+| `ENGINE_ROOT`    | `/var/lib/servd`    | Native engine state: images, layers, build caches, sandboxes. |
+| `ENGINE_BRIDGE`  | `servd0`            | Bridge interface sandboxes attach to. |
+| `ENGINE_SUBNET`  | `10.88.0.0/16`      | Sandbox address range (gateway = first address). |
+| `ENGINE_ID_SHIFT`| `100000`            | Host uid/gid that sandbox root maps to (65536 ids from here). |
+| `REGISTRY_MIRROR`| *(unset)*           | Docker Hub pull-through mirror, e.g. `mirror.gcr.io` (avoids anonymous rate limits). |
+| `OCI_RUNTIME`    | *(runc or crun)*    | Path to the OCI runtime binary. |
+| `APPS_NETWORK`   | `servd-apps`        | Docker bridge network deployed apps run on (Docker runtime). |
 | `GITHUB_APP_ID`  | *(unset)*           | GitHub App id; enables private-repo clones via installation tokens (preferred over the OAuth token). |
 | `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_PATH` | *(unset)* | The App's private key (PEM inline, or a path to the `.pem`). Required when `GITHUB_APP_ID` is set. |
 
@@ -49,6 +89,67 @@ GitHub **App** with least-privilege, per-repo, read-only installation tokens:
 When the App is not configured, deploys fall back to the stored user OAuth
 token (public repos only).
 
+### Native engine
+
+By default the platform builds and runs apps itself — no Docker daemon, no
+BuildKit, no Railpack. It needs Linux, root, overlayfs, iptables and an OCI
+runtime binary (`runc` or `crun`), so run the platform on the host (not in
+its own container) for this; otherwise `RUNTIME=auto` falls back to Docker.
+
+**Builds** execute the Dockerfile the detector writes (or the repo's own, if
+it sticks to the supported subset: multi-stage `FROM … AS`, `RUN` with
+`--mount=type=cache|secret`, `COPY` incl. `--from`/`--chown`/`--chmod`/heredocs,
+`ENV`, `ARG`, `WORKDIR`, `USER`, `CMD`, `ENTRYPOINT`, `EXPOSE`). Each step runs
+in a sandbox and becomes a layer keyed by the content that produced it, so
+unchanged steps are skipped instantly; dependencies install from the
+manifests alone, so a code-only change reuses the install layer. Base images
+are pulled straight from registries (parallel, digest-verified), unpacked once
+and shared by every app. Build caches (npm, pip, Go, Next.js) persist per
+service and are never shared between services.
+
+**Apps** run in sandboxes the platform assembles itself; runc only performs
+the final start:
+
+- *user namespace*: sandbox root is an unprivileged host uid (`ENGINE_ID_SHIFT`)
+- *no capabilities* for apps, `no_new_privs`, seccomp filter (no mount,
+  namespaces, ptrace, bpf, io_uring, kernel keyrings, module loading, …)
+- *own network namespace* on an isolated bridge port: apps can't reach each
+  other, the host, or cloud metadata (169.254.0.0/16); egress is NATed
+- *cgroup limits* on memory, CPU and processes; masked `/proc` paths
+
+A supervisor restarts crashed apps (with backoff) and brings apps back after
+a host reboot; apps keep serving while the platform itself restarts.
+Redeploys are zero-downtime: the new version starts beside the old one and
+traffic moves only once it passes its health check, so a failed deploy leaves
+the previous version serving. Built images export to standard OCI layout, so
+they run anywhere (`docker load`, containerd, any registry).
+
+The `Sandbox` backend is an interface (layers + process + limits + network,
+not an OCI bundle), so a microVM backend such as Firecracker can be added for
+KVM hosts without touching the builder or deploy pipeline.
+
+### Builds
+
+Deploys from git are built by the in-house builder (`internal/builder`): it
+detects the stack and generates a small Dockerfile, which the native engine
+executes (or, with `RUNTIME=docker`, the host's Docker 23+ with BuildKit). A
+repo that ships a `Dockerfile` is built as-is:
+
+| Stack | Detected by | Version from | Serves |
+|-------|-------------|--------------|--------|
+| Next.js | `next` dependency | `.nvmrc`, `.node-version`, `engines.node` (default 22) | `start` script / `next start` on 3000 |
+| Static SPA | `build` script, no `start`, and `vite` / `astro` / `@vue/cli-service` / `react-scripts` | as above | build output via unprivileged nginx on 8080, SPA fallback |
+| Node | `package.json` | as above | `start` script, `main`, or `server.js`/`index.js`/… on 3000 |
+| Go | `go.mod` | `go` directive if newer than 1.25 | root or single `cmd/*` main package, distroless, 8080 |
+| Python | `requirements.txt` / `pyproject.toml` | `.python-version`, `runtime.txt`, `requires-python` (default 3.12) | Procfile `web:`, Django, uvicorn, gunicorn or `python main.py` on 8000 |
+| Static | `index.html` | — | unprivileged nginx on 8080 |
+
+npm, pnpm and yarn are picked from the lockfile. A service's env vars are
+passed to install/build steps as secrets, so values like `NEXT_PUBLIC_*` work
+at build time without ending up in image layers or history (changing one
+does rebuild the steps that use it). Toolchain variables (`PATH`, `HOME`, `NODE_ENV`, `PORT`, `LD_*`, …)
+are kept out of builds; the running container still gets them.
+
 ### Auth
 
 With `SESSION_SECRET` set (same value as the frontend's), every `/api/v1`
@@ -61,21 +162,58 @@ longer impersonate. Without `SESSION_SECRET`, it falls back to trusting
 
 The platform picks its store at startup:
 
-- **`MONGO_URI` set** → MongoDB. Services are stored in the `services`
-  collection as `{ _id, user, workspace, service }`, indexed on user/workspace.
+- **`DATABASE_URL` set** → PostgreSQL. Each service is a row in `services`
+  (JSONB `data`, indexed on account/workspace); the schema is created on start.
 - **unset** → the zero-dependency JSON file store (`DATA_FILE`).
 
-Run Mongo in Docker and the platform on the host (so `expose` still works):
+Run Postgres in Docker and the platform on the host (so `expose` still works):
 
 ```bash
-docker compose up -d mongo
-cd platform && MONGO_URI=mongodb://localhost:27017 ./platform
+docker run -d --name servd-pg -e POSTGRES_PASSWORD=dev -p 5432:5432 postgres:16
+DATABASE_URL=postgres://postgres:dev@localhost:5432/postgres ./platform
 ```
+
+## Deploy to an Ubuntu server
+
+On a fresh Ubuntu 22.04/24.04 server (or Debian), with a wildcard DNS record
+`*.dynaserve.app` pointing at it:
+
+```bash
+sudo git clone https://github.com/dynaserve/servd.git /opt/servd
+cd /opt/servd
+sudo APPS_DOMAIN=dynaserve.app ACME_EMAIL=ops@dynaserve.app ops/install.sh --check
+```
+
+Apps are then served on ports 80/443 at `https://<app>-<id>.dynaserve.app`,
+and the API at `https://api.dynaserve.app`. Certificates come from Let's
+Encrypt on each name's first visit (a few seconds) and renew automatically.
+Leave `APPS_DOMAIN` out to serve apps on ports 9000–9100 instead.
+
+The script installs `runc`, git and iptables (and Go, if needed, to build),
+builds `servd` into `/usr/local/bin`, writes `/etc/servd/servd.env` with
+freshly generated secrets, opens ports 8080 and 9000–9100 if `ufw` is on, and
+starts the `servd` systemd service. `--check` first runs the isolation
+self-test on your machine (real sandboxes: user namespace, limits, network
+rules, builds); leave it off on later runs.
+
+Then:
+
+- Point the dashboard at `https://api.dynaserve.app` (`NEXT_PUBLIC_PLATFORM_URL`)
+  and give it the same `SESSION_SECRET` as `/etc/servd/servd.env`.
+- Change settings in `/etc/servd/servd.env`, then `sudo systemctl restart servd`.
+- Logs: `journalctl -u servd -f`.
+- Upgrade: `cd /opt/servd && sudo git pull && sudo ops/install.sh`. Running
+  apps keep serving while the platform restarts.
+
+Use a machine you can give to Servd: it runs as root, manages its own bridge
+(`servd0`, 10.88.0.0/16) and firewall chains, and keeps data in
+`/var/lib/servd`.
 
 ## Run in Docker
 
-The platform is a static, stdlib-only binary, so the image is tiny (distroless)
-and needs no MongoDB or Docker-in-Docker. Start Docker Desktop / your VM first,
+The platform is a static, pure-Go binary, so the image is tiny (distroless)
+and needs no database or Docker-in-Docker. In a container the native engine
+isn't available (it needs the host), so deploys use `RUNTIME=docker` there. Start Docker Desktop / your VM first,
 then from the repo root:
 
 ```bash
@@ -85,7 +223,6 @@ docker compose up --build
 Or by hand:
 
 ```bash
-cd platform
 docker build -t servd-platform .
 docker run -d --name servd-platform -p 8080:8080 -v servd-data:/data servd-platform
 ```
@@ -123,11 +260,37 @@ should verify a signed session token instead.
 | GET    | `/api/v1/services/{id}/logs`               | Live runtime logs of the container |
 | POST   | `/api/v1/services/{id}/expose`             | Proxy a public URL to a running app |
 | POST   | `/api/v1/services/{id}/unexpose`           | Stop the proxy                   |
+| PUT    | `/api/v1/services/{id}/domains`            | Attach custom domains (domain mode) |
+| POST   | `/api/v1/workspaces`                       | Create a workspace               |
+| DELETE | `/api/v1/workspaces/{wid}`                 | Delete a workspace and tear down its services |
 | POST   | `/api/v1/github/token`                     | Store the caller's GitHub token (for private-repo clones) |
+| POST   | `/api/v1/github/installation`              | Store the caller's GitHub App installation id |
+| GET    | `/api/v1/github/repos`                     | Repos the GitHub App can access (repo picker) |
+
+### Domains and HTTPS
+
+With `APPS_DOMAIN` set, Servd is its own front door on ports 80 and 443:
+
+- Every deployed service gets `https://<title>-<id>.APPS_DOMAIN`. The name is
+  kept across redeploys and title changes.
+- Customers can add their own domains:
+  `PUT /api/v1/services/{id}/domains` with `{"domains":["www.shop.com"]}`, plus
+  a DNS record (CNAME to the service's hostname, or A to the server). A domain
+  belongs to the first service that claims it until that service is deleted,
+  and names under `APPS_DOMAIN` are reserved for the platform.
+- Certificates are requested only for names that are actually routed, so
+  pointing random names at the server can't make it request certificates.
+- HTTP redirects to HTTPS; TLS 1.2+ only. Unknown names and apps that are
+  restarting get a short explanatory page.
+
+Let's Encrypt issues at most 50 new certificates per week per registered
+domain, and each app gets its own. Past that rate, wildcard certificates
+(DNS-01 via your DNS provider's API) are the next step.
 
 ### Exposing a running app (reverse proxy)
 
-`expose` points a public port at a locally-running app (e.g. a Next.js dev
+Port mode only (no `APPS_DOMAIN`); on a public server apps are made public by
+their deploys. `expose` points a public port at a locally-running app (e.g. a Next.js dev
 server) so it's reachable at a real URL. Each exposed service gets its own port
 (9000–9100) — a dedicated port, not a path prefix, so apps with absolute asset
 paths like Next.js's `/_next/*` work with no rewriting.
@@ -150,9 +313,21 @@ in `url`. Exposed services are re-proxied automatically on restart.
 
 CORS is open (dev) so the browser can call `:8080` directly.
 
+## Tests
+
+```bash
+go test ./...                                          # unit tests
+sudo SERVD_INTEGRATION=1 go test ./internal/sandbox ./internal/engine
+```
+
+The integration tests need root, runc and registry access; they build and run
+real sandboxes and check isolation (uid mapping, capabilities, seccomp,
+network rules), build caching and secret handling. Set `REGISTRY_MIRROR` if
+Docker Hub rate-limits you.
+
 ## Postman
 
-Import `servd-platform.postman_collection.json`. Set the collection variables
+Import `docs/servd-platform.postman_collection.json`. Set the collection variables
 `baseUrl`, `user`, and `workspaceId`; run **Create service** first — it captures
 the new `serviceId` for the get/patch/deploy/delete requests.
 

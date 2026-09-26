@@ -1,0 +1,186 @@
+// Command servd is the Servd control-plane API. It persists services to a JSON
+// file (or PostgreSQL when DATABASE_URL is set) and serves the REST API the
+// frontend consumes. Docker is optional: without it, deploys only record a
+// marker.
+//
+// Config via environment:
+//
+//	LISTEN_ADDR  address to bind (default ":8080" — all interfaces, LAN-reachable)
+//	DATA_FILE    path to the JSON store (default "./data/store.json")
+//
+// See README.md for the full list.
+package main
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"servd/platform/internal/api"
+	"servd/platform/internal/deploy"
+	"servd/platform/internal/github"
+	"servd/platform/internal/proxy"
+	"servd/platform/internal/store"
+)
+
+func main() {
+	addr := env("LISTEN_ADDR", ":8080")
+	publicHost := env("PUBLIC_HOST", "localhost")
+	region := env("REGION", "AU") // advertised in the X-Region response header
+
+	st, err := openStore()
+	if err != nil {
+		log.Fatalf("open store: %v", err)
+	}
+
+	appsDomain := os.Getenv("APPS_DOMAIN")
+	apiDomain := os.Getenv("API_DOMAIN")
+	if apiDomain == "" && appsDomain != "" {
+		apiDomain = "api." + appsDomain
+	}
+	px, err := proxy.NewManager(proxy.Config{
+		Region:        region,
+		PublicHost:    publicHost,
+		PortStart:     9000,
+		PortEnd:       9100,
+		AppsDomain:    appsDomain,
+		APIDomain:     apiDomain,
+		HTTPAddr:      env("HTTP_ADDR", ":80"),
+		HTTPSAddr:     env("HTTPS_ADDR", ":443"),
+		TLS:           env("TLS", "on") != "off",
+		StateDir:      env("ROUTER_STATE", "/var/lib/servd/router"),
+		ACMEEmail:     os.Getenv("ACME_EMAIL"),
+		ACMEDirectory: os.Getenv("ACME_DIRECTORY"),
+	})
+	if err != nil {
+		log.Fatalf("router: %v", err)
+	}
+	restoreProxies(st, px)
+
+	// Auth + at-rest encryption config.
+	sessionSecret := os.Getenv("SESSION_SECRET")
+	if sessionSecret == "" {
+		log.Printf("SESSION_SECRET unset: DEV AUTH (trusts X-User header) — not for production")
+	} else {
+		log.Printf("session auth enabled (verifies the frontend session cookie)")
+	}
+	var encKey []byte
+	if k := os.Getenv("ENCRYPTION_KEY"); len(k) == 32 {
+		encKey = []byte(k)
+	} else if k != "" {
+		log.Printf("ENCRYPTION_KEY must be 32 bytes (got %d): GitHub token storage disabled", len(k))
+	}
+
+	// Optional GitHub App: mints installation tokens for private-repo clones.
+	githubApp, err := github.New()
+	if err != nil {
+		log.Printf("github app config error: %v", err)
+	} else if githubApp != nil {
+		log.Printf("github app enabled (private-repo installs)")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Deploy engine: the real clone → build → isolated container → URL
+	// pipeline, on the native engine or Docker (see openRuntime).
+	var deployer *deploy.Deployer
+	if rt := openRuntime(ctx); rt != nil {
+		deployer = deploy.New(st, rt, px, encKey, githubApp)
+		deployer.Prewarm() // pre-pull base images so first builds start warm
+		log.Printf("deploy engine enabled; pre-warming base images")
+	}
+
+	srv := api.New(api.Config{
+		Store:         st,
+		Proxy:         px,
+		Deployer:      deployer,
+		SessionSecret: sessionSecret,
+		EncKey:        encKey,
+		Region:        region,
+	})
+	handler := srv.Routes()
+	px.SetAPIHandler(handler)
+	if u := px.APIURL(); u != "" {
+		log.Printf("API also served at %s", u)
+	}
+	go func() {
+		if err := px.Serve(ctx); err != nil {
+			log.Printf("router stopped: %v", err)
+			stop()
+		}
+	}()
+
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		log.Printf("servd-platform listening on %s", addr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("server error: %v", err)
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = httpServer.Shutdown(shutdownCtx)
+}
+
+// openStore selects the persistence backend: PostgreSQL when DATABASE_URL is
+// set, otherwise the zero-dependency JSON file store.
+func openStore() (store.Storer, error) {
+	if url := firstEnv("DATABASE_URL", "POSTGRES_URL"); url != "" {
+		log.Printf("using PostgreSQL store")
+		return store.NewPostgresStore(url)
+	}
+	dataFile := env("DATA_FILE", "./data/store.json")
+	log.Printf("using file store (%s)", dataFile)
+	return store.NewFileStore(dataFile)
+}
+
+// firstEnv returns the first of keys that is set and non-empty.
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// restoreProxies re-exposes services that were exposed before a restart, so
+// their public URLs keep working.
+func restoreProxies(st store.Storer, px *proxy.Manager) {
+	all, err := st.AllServices()
+	if err != nil {
+		log.Printf("restore proxies: list services failed: %v", err)
+		return
+	}
+	for _, o := range all {
+		exposed, _ := o.Service["exposed"].(bool)
+		target, _ := o.Service["proxyTarget"].(string)
+		if exposed && target != "" {
+			if _, err := px.Expose(deploy.ServiceRoute(o.User, o.Service, target)); err != nil {
+				log.Printf("restore proxy for %s failed: %v", store.IDOf(o.Service), err)
+			}
+		}
+	}
+}
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
