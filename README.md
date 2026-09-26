@@ -166,6 +166,37 @@ docker run -d --name servd-pg -e POSTGRES_PASSWORD=dev -p 5432:5432 postgres:16
 DATABASE_URL=postgres://postgres:dev@localhost:5432/postgres ./platform
 ```
 
+## Deploy to an Ubuntu server
+
+On a fresh Ubuntu 22.04/24.04 server (or Debian), as a user with sudo:
+
+```bash
+sudo git clone https://github.com/dynaserve/servd.git /opt/servd
+cd /opt/servd
+sudo ops/install.sh --check
+```
+
+The script installs `runc`, git and iptables (and Go, if needed, to build),
+builds `servd` into `/usr/local/bin`, writes `/etc/servd/servd.env` with
+freshly generated secrets, opens ports 8080 and 9000–9100 if `ufw` is on, and
+starts the `servd` systemd service. `--check` first runs the isolation
+self-test on your machine (real sandboxes: user namespace, limits, network
+rules, builds); leave it off on later runs.
+
+Then:
+
+- Point the dashboard at `http://<server>:8080` (`NEXT_PUBLIC_PLATFORM_URL`)
+  and give it the same `SESSION_SECRET` as `/etc/servd/servd.env`.
+- Deployed apps get URLs on `http://<server>:9000`–`9100`.
+- Change settings in `/etc/servd/servd.env`, then `sudo systemctl restart servd`.
+- Logs: `journalctl -u servd -f`.
+- Upgrade: `cd /opt/servd && sudo git pull && sudo ops/install.sh`. Running
+  apps keep serving while the platform restarts.
+
+Use a machine you can give to Servd: it runs as root, manages its own bridge
+(`servd0`, 10.88.0.0/16) and firewall chains, and keeps data in
+`/var/lib/servd`.
+
 ## Run in Docker
 
 The platform is a static, pure-Go binary, so the image is tiny (distroless)

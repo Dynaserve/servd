@@ -1,0 +1,21 @@
+[Unit]
+Description=Servd platform (API, builder and app runner)
+Documentation=file:///opt/servd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/servd/servd.env
+WorkingDirectory=/var/lib/servd
+ExecStart=/usr/local/bin/servd
+Restart=always
+RestartSec=2
+# Only stop servd itself: customer apps keep serving while the platform
+# restarts or upgrades, and servd re-attaches to them when it comes back.
+KillMode=process
+LimitNOFILE=1048576
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
